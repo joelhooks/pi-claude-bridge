@@ -2,7 +2,12 @@
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { collectPromptSkills, projectPromptCapture, PromptCaptures } from "../src/prompt-capture.js";
+import {
+	collectPromptSkills,
+	findBaseSystemPromptLength,
+	projectPromptCapture,
+	PromptCaptures,
+} from "../src/prompt-capture.js";
 
 const PI_HARNESS = "You are an expert coding assistant operating inside pi. Pi documentation: pi packages (docs/packages.md).";
 const PARENT_KEY = `${PI_HARNESS}\n\n<project_context>raw parent context</project_context>\nCurrent working directory: /parent`;
@@ -68,6 +73,97 @@ describe("PromptCaptures", () => {
 		assert.match(projected, /SUFFIX/, "and so must its suffix");
 		assert.doesNotMatch(projected, /Pi documentation/, "but never Pi's harness, which the projection replaces");
 		assert.equal(captures.resolve(wrapped), undefined, "a derived capture is not retained");
+	});
+
+	it("resolves a triggerTurn wake from Pi's rebuilt base prompt", () => {
+		const base = `${PI_HARNESS}\n\nCLI APPEND\nCurrent date: 2026-09-12\nCurrent working directory: /project`;
+		const chainedAppend = "\n\nROOT APPEND RULES\n\nBRAIN RULES";
+		const assembled = `${base}${chainedAppend}`;
+		const captures = new PromptCaptures();
+		captures.record(assembled, capture({
+			append: "CLI APPEND",
+			baseSystemPromptLength: findBaseSystemPromptLength(assembled, "/project"),
+			contextFiles: [{ path: "/AGENTS.md", content: "project rules" }],
+			skills: [skill("browser")],
+		}));
+
+		const wakeCapture = captures.resolveOrDerive(base);
+		const projected = projectPromptCapture(wakeCapture, { skillReadTool: "mcp" });
+
+		assert.match(projected, /project rules/);
+		assert.match(projected, /browser/);
+		assert.match(projected, /ROOT APPEND RULES/);
+		assert.match(projected, /BRAIN RULES/);
+		assert.equal(projected.match(/CLI APPEND/g)?.length, 1);
+		assert.equal(projected.match(/ROOT APPEND RULES/g)?.length, 1);
+		assert.doesNotMatch(projected, /Pi documentation/);
+		assert.throws(
+			() => captures.resolveOrDerive(base.slice(0, -1)),
+			/no capture for this .* system prompt/,
+			"an arbitrary truncated prefix must still fail closed",
+		);
+	});
+
+	it("finds the dated base boundary around inherited and appended directory markers", () => {
+		const inherited = "parent\nCurrent date: 2026-09-11\nCurrent working directory: /same";
+		const current = `${inherited}\nchild\nCurrent date: 2026-09-12\nCurrent working directory: /same`;
+		const assembled = `${current}\n\nLATE APPEND\nCurrent date: 2026-09-12\nCurrent working directory: /same-other`;
+		assert.equal(findBaseSystemPromptLength(assembled, "/same"), current.length);
+		assert.equal(findBaseSystemPromptLength(assembled, "/missing"), undefined);
+	});
+
+	it("projects chained appends once through nested custom prompts", () => {
+		const captures = new PromptCaptures();
+		const parentBase = `${PI_HARNESS}\nCurrent date: 2026-09-12\nCurrent working directory: /parent`;
+		const parentKey = `${parentBase}\n\nPARENT LATE APPEND`;
+		captures.record(parentKey, capture({
+			baseSystemPromptLength: findBaseSystemPromptLength(parentKey, "/parent"),
+			contextFiles: [{ path: "/parent/AGENTS.md", content: "parent rules" }],
+		}));
+
+		const childCustom = `child prefix\n${parentKey}\nchild suffix`;
+		const childBase = `${childCustom}\nCurrent date: 2026-09-12\nCurrent working directory: /child`;
+		const childKey = `${childBase}\n\nCHILD LATE APPEND`;
+		captures.record(childKey, capture({
+			custom: childCustom,
+			baseSystemPromptLength: findBaseSystemPromptLength(childKey, "/child"),
+			contextFiles: [{ path: "/child/AGENTS.md", content: "child rules" }],
+		}));
+
+		const wakeCapture = captures.resolveOrDerive(childBase);
+		const projected = projectPromptCapture(wakeCapture, { skillReadTool: "mcp" });
+		assert.match(projected, /parent rules/);
+		assert.match(projected, /child rules/);
+		assert.equal(projected.match(/PARENT LATE APPEND/g)?.length, 1);
+		assert.equal(projected.match(/CHILD LATE APPEND/g)?.length, 1);
+		assert.doesNotMatch(projected, /Pi documentation/);
+	});
+
+	it("chooses the newest base capture when an evicted ancestor is traversed last", () => {
+		const captures = new PromptCaptures(2);
+		const base = `${PI_HARNESS}\nCurrent date: 2026-09-12\nCurrent working directory: /same`;
+		const oldKey = `${base}\n\nOLD APPEND`;
+		const childKey = `${oldKey}\nchild`;
+		const newKey = `${base}\n\nNEW APPEND`;
+		const baseSystemPromptLength = findBaseSystemPromptLength(oldKey, "/same");
+
+		captures.record(oldKey, capture({ baseSystemPromptLength }));
+		captures.record(childKey, capture({ custom: oldKey }));
+		captures.record(newKey, capture({ baseSystemPromptLength }));
+		assert.equal(captures.resolve(oldKey), undefined, "old key must be evicted but reachable through child");
+		assert.ok(captures.resolve(childKey), "make the child the newest live key");
+
+		const projected = projectPromptCapture(captures.resolveOrDerive(base), { skillReadTool: "mcp" });
+		assert.match(projected, /NEW APPEND/);
+		assert.doesNotMatch(projected, /OLD APPEND/);
+	});
+
+	it("clears captures at a session boundary", () => {
+		const captures = new PromptCaptures();
+		captures.record(PARENT_KEY, capture());
+		captures.clear();
+		assert.equal(captures.size, 0);
+		assert.throws(() => captures.resolveOrDerive(PARENT_KEY), /no capture/);
 	});
 
 	it("revives an exact capture whose lookup key was evicted", () => {

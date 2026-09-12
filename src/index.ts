@@ -20,6 +20,7 @@ import { makePromptStream, userMessage, type PromptStream } from "./prompt-strea
 import { claudeCodeSettings, loadConfig, markStartupNoticeShown, type Config } from "./config.js";
 import {
 	collectPromptSkills,
+	findBaseSystemPromptLength,
 	projectPromptCapture,
 	PromptCaptures,
 } from "./prompt-capture.js";
@@ -2014,6 +2015,7 @@ export default function (pi: ExtensionAPI) {
 	const clearSession = (event: string) => {
 		debug(`${event}: clearing session ${sharedSession?.sessionId?.slice(0, 8) ?? "none"}`);
 		sharedSession = null;
+		promptCaptures.clear();
 
 		// Clear the global streamSimple if this instance registered it.
 		// This allows /reload to work — the old instance clears the flag so
@@ -2040,6 +2042,9 @@ export default function (pi: ExtensionAPI) {
 		promptCaptures.record(event.systemPrompt, {
 			custom: options?.customPrompt,
 			append: options?.appendSystemPrompt,
+			baseSystemPromptLength: options
+				? findBaseSystemPromptLength(event.systemPrompt, options.cwd)
+				: undefined,
 			contextFiles: options?.contextFiles ?? [],
 			skills: hasRead ? options?.skills ?? [] : [],
 		});

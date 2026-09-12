@@ -8,6 +8,8 @@ import { renderSkillsBlock, type SkillReadTool } from "./skills.js";
 export type PromptCaptureInput = {
 	custom?: string;
 	append?: string;
+	/** Length of Pi's base prompt before before_agent_start handlers appended text. */
+	baseSystemPromptLength?: number;
 	contextFiles: { path: string; content: string }[];
 	skills: Skill[];
 };
@@ -17,6 +19,28 @@ type InheritedPrompt = {
 	end: number;
 	parent: PromptCapture;
 };
+
+/** Find where Pi's dated base prompt ends and extension appends begin. */
+export function findBaseSystemPromptLength(systemPrompt: string, cwd: string): number | undefined {
+	const directoryMarker = `\nCurrent working directory: ${cwd.replace(/\\/g, "/")}`;
+	const datePrefix = "\nCurrent date: ";
+	let start = systemPrompt.lastIndexOf(directoryMarker);
+	while (start !== -1) {
+		const dateStart = start - datePrefix.length - 10;
+		const date = dateStart >= 0 ? systemPrompt.slice(dateStart + datePrefix.length, start) : "";
+		const end = start + directoryMarker.length;
+		const next = systemPrompt[end];
+		if (
+			systemPrompt.startsWith(datePrefix, dateStart)
+			&& /^\d{4}-\d{2}-\d{2}$/.test(date)
+			&& (next === undefined || next === "\n" || next === "\r")
+		) {
+			return end;
+		}
+		start = systemPrompt.lastIndexOf(directoryMarker, start - 1);
+	}
+	return undefined;
+}
 
 export type PromptCapture = PromptCaptureInput & {
 	assembledPrompt: string;
@@ -48,6 +72,8 @@ export type PromptCaptureDiagnostic = {
 
 export class PromptCaptures {
 	private readonly captures = new Map<string, PromptCapture>();
+	private readonly recency = new WeakMap<PromptCapture, number>();
+	private recencyClock = 0;
 	/** Invoked with everything that would otherwise be lost when resolution throws,
 	 *  so the bridge can write it to its debug log. Kept off the throw path itself:
 	 *  the resolver is hot and the caller may own a faster sink than string-building.
@@ -69,6 +95,10 @@ export class PromptCaptures {
 		this.onDiagnose = onDiagnose ?? (() => {});
 	}
 
+	clear(): void {
+		this.captures.clear();
+	}
+
 	record(systemPrompt: string, input: PromptCaptureInput): void {
 		const existing = this.captures.get(systemPrompt);
 		const customChanged = existing?.custom !== input.custom;
@@ -82,6 +112,7 @@ export class PromptCaptures {
 
 		capture.custom = input.custom;
 		capture.append = input.append;
+		capture.baseSystemPromptLength = input.baseSystemPromptLength;
 		capture.contextFiles = input.contextFiles.map((file) => ({ ...file }));
 		capture.skills = [...input.skills];
 		if (!existing || customChanged) {
@@ -107,6 +138,7 @@ export class PromptCaptures {
 	 *  where the parent's own prompt was evicted and its next turn resolved to
 	 *  nothing. */
 	private touch(systemPrompt: string, capture: PromptCapture): void {
+		this.recency.set(capture, ++this.recencyClock);
 		this.captures.delete(systemPrompt);
 		this.captures.set(systemPrompt, capture);
 		// Trims here, not only in record(): reviving an evicted node re-adds a key that
@@ -146,10 +178,30 @@ export class PromptCaptures {
 		// edges keep the node alive. findInheritedPrompts deliberately skips a node whose
 		// key *is* the prompt, so without this an evicted exact match would derive
 		// nothing and throw. Touching it puts the key back.
-		const revived = this.reachableCaptures().find((node) => node.assembledPrompt === systemPrompt);
+		const reachable = this.reachableCaptures();
+		const revived = this.newestCapture(
+			reachable.filter((node) => node.assembledPrompt === systemPrompt),
+		);
 		if (revived) {
 			this.touch(systemPrompt, revived);
 			return revived;
+		}
+
+		// pi.sendMessage(..., { triggerTurn: true }) starts a provider turn without
+		// before_agent_start. If tools or resources rebuilt Pi's base prompt after the
+		// prior user turn, the live prompt is that base while our only capture is the
+		// same base plus chained extension appends. Reuse the newest exact base match;
+		// accepting an arbitrary prefix would hide genuine prompt truncation.
+		const baseMatch = this.newestCapture(
+			reachable.filter(
+				(node) =>
+					node.baseSystemPromptLength === systemPrompt.length
+					&& node.assembledPrompt.startsWith(systemPrompt),
+			),
+		);
+		if (baseMatch) {
+			this.touch(baseMatch.assembledPrompt, baseMatch);
+			return baseMatch;
 		}
 
 		const embedded = this.findInheritedPrompts(systemPrompt, systemPrompt);
@@ -174,6 +226,19 @@ export class PromptCaptures {
 
 	get size(): number {
 		return this.captures.size;
+	}
+
+	private newestCapture(candidates: PromptCapture[]): PromptCapture | undefined {
+		let newest: PromptCapture | undefined;
+		let newestRecency = -1;
+		for (const candidate of candidates) {
+			const recency = this.recency.get(candidate) ?? -1;
+			if (recency > newestRecency) {
+				newest = candidate;
+				newestRecency = recency;
+			}
+		}
+		return newest;
 	}
 
 	/** Longest shared-prefix matches, best first, for the throw diagnostic. */
@@ -285,11 +350,17 @@ function projectCapture(
 		});
 
 		const custom = projectCustom(capture, options, visiting);
+		const chainedAppend =
+			capture.baseSystemPromptLength !== undefined
+			&& capture.baseSystemPromptLength < capture.assembledPrompt.length
+				? capture.assembledPrompt.slice(capture.baseSystemPromptLength)
+				: undefined;
 		const parts = [
 			formatProjectContext(capture.contextFiles),
 			renderSkillsBlock(ownSkills, options.skillReadTool),
 			custom,
 			capture.append,
+			chainedAppend,
 		].filter((part): part is string => Boolean(part));
 		return parts.length > 0 ? parts.join("\n\n") : undefined;
 	} finally {
