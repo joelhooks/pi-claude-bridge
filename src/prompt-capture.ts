@@ -14,6 +14,10 @@ export type PromptCaptureInput = {
 	skills: Skill[];
 };
 
+export type PromptCaptureSnapshot = PromptCaptureInput & {
+	assembledPrompt: string;
+};
+
 type InheritedPrompt = {
 	start: number;
 	end: number;
@@ -97,6 +101,33 @@ export class PromptCaptures {
 
 	clear(): void {
 		this.captures.clear();
+	}
+
+	/** Serializable capture graph ordered parent-first for reload restoration. */
+	snapshot(): PromptCaptureSnapshot[] {
+		const reachable = new Set<PromptCapture>();
+		const visit = (capture: PromptCapture): void => {
+			if (reachable.has(capture)) return;
+			for (const inherited of capture.inherited) visit(inherited.parent);
+			reachable.add(capture);
+		};
+		for (const capture of this.captures.values()) visit(capture);
+
+		return [...reachable].map((capture) => ({
+			assembledPrompt: capture.assembledPrompt,
+			custom: capture.custom,
+			append: capture.append,
+			baseSystemPromptLengths: capture.baseSystemPromptLengths === undefined
+				? undefined
+				: [...capture.baseSystemPromptLengths],
+			contextFiles: capture.contextFiles.map((file) => ({ ...file })),
+			skills: [...capture.skills],
+		}));
+	}
+
+	restore(snapshots: readonly PromptCaptureSnapshot[]): void {
+		this.clear();
+		for (const snapshot of snapshots) this.record(snapshot.assembledPrompt, snapshot);
 	}
 
 	record(systemPrompt: string, input: PromptCaptureInput): void {

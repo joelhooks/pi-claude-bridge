@@ -92,7 +92,10 @@ describe("PromptCaptures", () => {
 			skills: [skill("browser")],
 		}));
 
-		const wakeCapture = captures.resolveOrDerive(base);
+		const reloaded = new PromptCaptures();
+		reloaded.restore(captures.snapshot());
+		captures.clear();
+		const wakeCapture = reloaded.resolveOrDerive(base);
 		const projected = projectPromptCapture(wakeCapture, { skillReadTool: "mcp" });
 
 		assert.match(projected, /project rules/);
@@ -103,7 +106,7 @@ describe("PromptCaptures", () => {
 		assert.equal(projected.match(/ROOT APPEND RULES/g)?.length, 1);
 		assert.doesNotMatch(projected, /Pi documentation/);
 		assert.throws(
-			() => captures.resolveOrDerive(base.slice(0, -2)),
+			() => reloaded.resolveOrDerive(base.slice(0, -2)),
 			/no capture for this .* system prompt/,
 			"an arbitrary truncated prefix must still fail closed",
 		);
@@ -135,7 +138,10 @@ describe("PromptCaptures", () => {
 			contextFiles: [{ path: "/child/AGENTS.md", content: "child rules" }],
 		}));
 
-		const wakeCapture = captures.resolveOrDerive(childBase);
+		const reloaded = new PromptCaptures();
+		reloaded.restore(captures.snapshot());
+		captures.clear();
+		const wakeCapture = reloaded.resolveOrDerive(childBase);
 		const projected = projectPromptCapture(wakeCapture, { skillReadTool: "mcp" });
 		assert.match(projected, /parent rules/);
 		assert.match(projected, /child rules/);

@@ -2,6 +2,7 @@
 
 ## UNRELEASED
 
+- **Fix: the first extension wake after `/reload` keeps prompt captures** — Reload shutdown now snapshots the bounded capture graph into process-local ephemeral state, and the replacement extension restores it only for `session_start:reload`. New, resumed, and forked sessions still clear captures so policy cannot leak between sessions.
 - **Fix: Pi 0.85 wake turns recognize the undated cwd boundary** — Pi 0.85 removed the `Current date` line and its custom-prompt path can retain one trailing line ending. Prompt capture now records both strict cwd-marker boundaries, so extension-triggered turns can reuse the capture without accepting arbitrary truncation.
 - **Fix: extension-triggered wake turns keep Pi context and chained instructions** — `pi.sendMessage(..., { triggerTurn: true })` can enter the provider without running `before_agent_start`, after Pi has restored its base prompt. The bridge now recognizes that exact recorded base boundary and reuses the prior capture, including text appended by other `before_agent_start` handlers, instead of repeatedly failing Bellwether watch notifications with `prompt-capture: no capture`.
 - **Fix: git-status changes no longer bust the prompt cache (issue #73)** — the `claude_code` preset embeds a git-status snapshot in the cached system block, so any git transition (new file, staging, commit) rewrote the whole conversation prefix at cache-write rates. The provider path now sets `includeGitInstructions: false`, stripping the block with no other cost.

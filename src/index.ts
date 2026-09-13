@@ -23,6 +23,7 @@ import {
 	findBaseSystemPromptLengths,
 	projectPromptCapture,
 	PromptCaptures,
+	type PromptCaptureSnapshot,
 } from "./prompt-capture.js";
 import { collectCarriedAttachments, placeCarriedAttachments, type CarriedAttachment } from "./attachments.js";
 import { createToolServer } from "./mcp-server.js";
@@ -852,6 +853,15 @@ function showStartupNoticeOnce(): void {
 
 // Captures of what pi assembled per agent; see src/prompt-capture.ts for why this
 // is keyed rather than held in a single slot.
+const PROMPT_CAPTURE_RELOAD_KEY = Symbol.for("@joelhooks/pi-claude-bridge/prompt-capture-reload-v1");
+type PromptCaptureReloadCarrier = { version: 1; captures: PromptCaptureSnapshot[] };
+const promptCaptureReloadGlobals = () => globalThis as typeof globalThis & Record<symbol, unknown>;
+const isPromptCaptureReloadCarrier = (value: unknown): value is PromptCaptureReloadCarrier =>
+	typeof value === "object"
+	&& value !== null
+	&& (value as { version?: unknown }).version === 1
+	&& Array.isArray((value as { captures?: unknown }).captures);
+
 const promptCaptures = new PromptCaptures(256, (diagnostic) => {
 	const first = diagnostic.matches[0];
 	debug(
@@ -2029,8 +2039,19 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", (event, ctx) => {
 		piUI = ctx.ui;
 		piMode = ctx.mode;
-		if (event.reason === "new" || event.reason === "resume" || event.reason === "fork") {
-			clearSession(`session_start:${event.reason}`);
+		const globals = promptCaptureReloadGlobals();
+		if (event.reason === "reload") {
+			const carrier = globals[PROMPT_CAPTURE_RELOAD_KEY];
+			delete globals[PROMPT_CAPTURE_RELOAD_KEY];
+			if (isPromptCaptureReloadCarrier(carrier)) {
+				promptCaptures.restore(carrier.captures);
+				debug(`session_start:reload: restored ${carrier.captures.length} prompt captures`);
+			}
+		} else {
+			delete globals[PROMPT_CAPTURE_RELOAD_KEY];
+			if (event.reason === "new" || event.reason === "resume" || event.reason === "fork") {
+				clearSession(`session_start:${event.reason}`);
+			}
 		}
 	});
 	// `--system-prompt` replaces pi's default rather than adding to it, but Claude
@@ -2049,7 +2070,16 @@ export default function (pi: ExtensionAPI) {
 			skills: hasRead ? options?.skills ?? [] : [],
 		});
 	});
-	pi.on("session_shutdown", () => {
+	pi.on("session_shutdown", (event) => {
+		const globals = promptCaptureReloadGlobals();
+		if (event.reason === "reload") {
+			globals[PROMPT_CAPTURE_RELOAD_KEY] = {
+				version: 1,
+				captures: promptCaptures.snapshot(),
+			} satisfies PromptCaptureReloadCarrier;
+		} else {
+			delete globals[PROMPT_CAPTURE_RELOAD_KEY];
+		}
 		reportLeaks("session_shutdown");
 		clearSession("session_shutdown");
 	});
