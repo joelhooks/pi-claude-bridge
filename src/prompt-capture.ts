@@ -8,8 +8,8 @@ import { renderSkillsBlock, type SkillReadTool } from "./skills.js";
 export type PromptCaptureInput = {
 	custom?: string;
 	append?: string;
-	/** Length of Pi's base prompt before before_agent_start handlers appended text. */
-	baseSystemPromptLength?: number;
+	/** Possible ends of Pi's base prompt before before_agent_start appends. */
+	baseSystemPromptLengths?: readonly number[];
 	contextFiles: { path: string; content: string }[];
 	skills: Skill[];
 };
@@ -20,26 +20,26 @@ type InheritedPrompt = {
 	parent: PromptCapture;
 };
 
-/** Find where Pi's dated base prompt ends and extension appends begin. */
-export function findBaseSystemPromptLength(systemPrompt: string, cwd: string): number | undefined {
+/**
+ * Find the strict cwd-line boundaries Pi has used across supported versions.
+ * Pi 0.85 removed the preceding date and its custom-prompt branch retains one
+ * trailing line ending. Keeping both marker-end and line-end candidates handles
+ * that shape without accepting arbitrary prompt prefixes.
+ */
+export function findBaseSystemPromptLengths(systemPrompt: string, cwd: string): number[] {
 	const directoryMarker = `\nCurrent working directory: ${cwd.replace(/\\/g, "/")}`;
-	const datePrefix = "\nCurrent date: ";
 	let start = systemPrompt.lastIndexOf(directoryMarker);
 	while (start !== -1) {
-		const dateStart = start - datePrefix.length - 10;
-		const date = dateStart >= 0 ? systemPrompt.slice(dateStart + datePrefix.length, start) : "";
 		const end = start + directoryMarker.length;
 		const next = systemPrompt[end];
-		if (
-			systemPrompt.startsWith(datePrefix, dateStart)
-			&& /^\d{4}-\d{2}-\d{2}$/.test(date)
-			&& (next === undefined || next === "\n" || next === "\r")
-		) {
-			return end;
+		if (next === undefined) return [end];
+		if (next === "\n") return [end, end + 1];
+		if (next === "\r") {
+			return [end, systemPrompt[end + 1] === "\n" ? end + 2 : end + 1];
 		}
 		start = systemPrompt.lastIndexOf(directoryMarker, start - 1);
 	}
-	return undefined;
+	return [];
 }
 
 export type PromptCapture = PromptCaptureInput & {
@@ -112,7 +112,9 @@ export class PromptCaptures {
 
 		capture.custom = input.custom;
 		capture.append = input.append;
-		capture.baseSystemPromptLength = input.baseSystemPromptLength;
+		capture.baseSystemPromptLengths = input.baseSystemPromptLengths === undefined
+			? undefined
+			: [...input.baseSystemPromptLengths];
 		capture.contextFiles = input.contextFiles.map((file) => ({ ...file }));
 		capture.skills = [...input.skills];
 		if (!existing || customChanged) {
@@ -195,7 +197,7 @@ export class PromptCaptures {
 		const baseMatch = this.newestCapture(
 			reachable.filter(
 				(node) =>
-					node.baseSystemPromptLength === systemPrompt.length
+					node.baseSystemPromptLengths?.includes(systemPrompt.length) === true
 					&& node.assembledPrompt.startsWith(systemPrompt),
 			),
 		);
@@ -350,10 +352,12 @@ function projectCapture(
 		});
 
 		const custom = projectCustom(capture, options, visiting);
+		const baseEnd = capture.baseSystemPromptLengths?.length
+			? Math.max(...capture.baseSystemPromptLengths)
+			: undefined;
 		const chainedAppend =
-			capture.baseSystemPromptLength !== undefined
-			&& capture.baseSystemPromptLength < capture.assembledPrompt.length
-				? capture.assembledPrompt.slice(capture.baseSystemPromptLength)
+			baseEnd !== undefined && baseEnd < capture.assembledPrompt.length
+				? capture.assembledPrompt.slice(baseEnd)
 				: undefined;
 		const parts = [
 			formatProjectContext(capture.contextFiles),

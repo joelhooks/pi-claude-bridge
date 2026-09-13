@@ -4,7 +4,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
 	collectPromptSkills,
-	findBaseSystemPromptLength,
+	findBaseSystemPromptLengths,
 	projectPromptCapture,
 	PromptCaptures,
 } from "../src/prompt-capture.js";
@@ -76,13 +76,18 @@ describe("PromptCaptures", () => {
 	});
 
 	it("resolves a triggerTurn wake from Pi's rebuilt base prompt", () => {
-		const base = `${PI_HARNESS}\n\nCLI APPEND\nCurrent date: 2026-09-12\nCurrent working directory: /project`;
+		const base = `${PI_HARNESS}\n\nCLI APPEND\nCurrent working directory: /project\n`;
 		const chainedAppend = "\n\nROOT APPEND RULES\n\nBRAIN RULES";
 		const assembled = `${base}${chainedAppend}`;
+		assert.deepEqual(
+			findBaseSystemPromptLengths(assembled, "/project"),
+			[base.length - 1, base.length],
+			"Pi 0.85's trailing newline and the older marker-end shape are both strict boundaries",
+		);
 		const captures = new PromptCaptures();
 		captures.record(assembled, capture({
 			append: "CLI APPEND",
-			baseSystemPromptLength: findBaseSystemPromptLength(assembled, "/project"),
+			baseSystemPromptLengths: findBaseSystemPromptLengths(assembled, "/project"),
 			contextFiles: [{ path: "/AGENTS.md", content: "project rules" }],
 			skills: [skill("browser")],
 		}));
@@ -98,7 +103,7 @@ describe("PromptCaptures", () => {
 		assert.equal(projected.match(/ROOT APPEND RULES/g)?.length, 1);
 		assert.doesNotMatch(projected, /Pi documentation/);
 		assert.throws(
-			() => captures.resolveOrDerive(base.slice(0, -1)),
+			() => captures.resolveOrDerive(base.slice(0, -2)),
 			/no capture for this .* system prompt/,
 			"an arbitrary truncated prefix must still fail closed",
 		);
@@ -108,8 +113,8 @@ describe("PromptCaptures", () => {
 		const inherited = "parent\nCurrent date: 2026-09-11\nCurrent working directory: /same";
 		const current = `${inherited}\nchild\nCurrent date: 2026-09-12\nCurrent working directory: /same`;
 		const assembled = `${current}\n\nLATE APPEND\nCurrent date: 2026-09-12\nCurrent working directory: /same-other`;
-		assert.equal(findBaseSystemPromptLength(assembled, "/same"), current.length);
-		assert.equal(findBaseSystemPromptLength(assembled, "/missing"), undefined);
+		assert.ok(findBaseSystemPromptLengths(assembled, "/same").includes(current.length));
+		assert.deepEqual(findBaseSystemPromptLengths(assembled, "/missing"), []);
 	});
 
 	it("projects chained appends once through nested custom prompts", () => {
@@ -117,7 +122,7 @@ describe("PromptCaptures", () => {
 		const parentBase = `${PI_HARNESS}\nCurrent date: 2026-09-12\nCurrent working directory: /parent`;
 		const parentKey = `${parentBase}\n\nPARENT LATE APPEND`;
 		captures.record(parentKey, capture({
-			baseSystemPromptLength: findBaseSystemPromptLength(parentKey, "/parent"),
+			baseSystemPromptLengths: findBaseSystemPromptLengths(parentKey, "/parent"),
 			contextFiles: [{ path: "/parent/AGENTS.md", content: "parent rules" }],
 		}));
 
@@ -126,7 +131,7 @@ describe("PromptCaptures", () => {
 		const childKey = `${childBase}\n\nCHILD LATE APPEND`;
 		captures.record(childKey, capture({
 			custom: childCustom,
-			baseSystemPromptLength: findBaseSystemPromptLength(childKey, "/child"),
+			baseSystemPromptLengths: findBaseSystemPromptLengths(childKey, "/child"),
 			contextFiles: [{ path: "/child/AGENTS.md", content: "child rules" }],
 		}));
 
@@ -145,11 +150,11 @@ describe("PromptCaptures", () => {
 		const oldKey = `${base}\n\nOLD APPEND`;
 		const childKey = `${oldKey}\nchild`;
 		const newKey = `${base}\n\nNEW APPEND`;
-		const baseSystemPromptLength = findBaseSystemPromptLength(oldKey, "/same");
+		const baseSystemPromptLengths = findBaseSystemPromptLengths(oldKey, "/same");
 
-		captures.record(oldKey, capture({ baseSystemPromptLength }));
+		captures.record(oldKey, capture({ baseSystemPromptLengths }));
 		captures.record(childKey, capture({ custom: oldKey }));
-		captures.record(newKey, capture({ baseSystemPromptLength }));
+		captures.record(newKey, capture({ baseSystemPromptLengths }));
 		assert.equal(captures.resolve(oldKey), undefined, "old key must be evicted but reachable through child");
 		assert.ok(captures.resolve(childKey), "make the child the newest live key");
 

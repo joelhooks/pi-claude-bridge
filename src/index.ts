@@ -20,7 +20,7 @@ import { makePromptStream, userMessage, type PromptStream } from "./prompt-strea
 import { claudeCodeSettings, loadConfig, markStartupNoticeShown, type Config } from "./config.js";
 import {
 	collectPromptSkills,
-	findBaseSystemPromptLength,
+	findBaseSystemPromptLengths,
 	projectPromptCapture,
 	PromptCaptures,
 } from "./prompt-capture.js";
@@ -2042,8 +2042,8 @@ export default function (pi: ExtensionAPI) {
 		promptCaptures.record(event.systemPrompt, {
 			custom: options?.customPrompt,
 			append: options?.appendSystemPrompt,
-			baseSystemPromptLength: options
-				? findBaseSystemPromptLength(event.systemPrompt, options.cwd)
+			baseSystemPromptLengths: options
+				? findBaseSystemPromptLengths(event.systemPrompt, options.cwd)
 				: undefined,
 			contextFiles: options?.contextFiles ?? [],
 			skills: hasRead ? options?.skills ?? [] : [],
