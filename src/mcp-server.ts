@@ -61,13 +61,23 @@ export function createToolServer(name: string, tools: McpToolDef[]) {
 	const byName = new Map(tools.map((tool) => [tool.name, tool]));
 	for (const tool of tools) assertObjectSchema(tool);
 
-	server.server.setRequestHandler(ListToolsRequestSchema, () => ({
-		tools: tools.map((tool) => ({
-			name: tool.name,
-			description: tool.description,
-			inputSchema: tool.inputSchema as Record<string, unknown>,
-		})),
-	}));
+	// Resolves the first time Claude Code asks for the tool list. Until then the
+	// query's tool pool does not contain these tools, and a request built before
+	// that point goes to the model without them. See the continuation path in
+	// index.ts for the one place that has to wait on it.
+	let markListed: () => void = () => {};
+	const listed = new Promise<void>((resolve) => { markListed = resolve; });
+
+	server.server.setRequestHandler(ListToolsRequestSchema, () => {
+		markListed();
+		return {
+			tools: tools.map((tool) => ({
+				name: tool.name,
+				description: tool.description,
+				inputSchema: tool.inputSchema as Record<string, unknown>,
+			})),
+		};
+	});
 
 	server.server.setRequestHandler(CallToolRequestSchema, async (request) => {
 		const tool = byName.get(request.params.name);
@@ -82,5 +92,5 @@ export function createToolServer(name: string, tools: McpToolDef[]) {
 		return { content, isError };
 	});
 
-	return { type: "sdk" as const, name, instance: server };
+	return { type: "sdk" as const, name, instance: server, listed };
 }
