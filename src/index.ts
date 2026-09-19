@@ -2,7 +2,7 @@ import { calculateCost, StringEnum, type AssistantMessage, type AssistantMessage
 import * as piAi from "@earendil-works/pi-ai";
 import { getModels } from "@earendil-works/pi-ai/compat";
 import { buildSessionContext, compact, generateBranchSummary, keyHint, type BranchSummaryResult, type CompactionEntry, type ExtensionAPI, type ExtensionContext, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
-import { query, type EffortLevel, type SDKMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
+import { query, type EffortLevel, type HookCallback, type SDKMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import type { Base64ImageSource, ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { Type } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
@@ -60,6 +60,22 @@ const RECORD_STREAM_PATH = process.env.CLAUDE_BRIDGE_RECORD_STREAM;
 const CC_CHILD_ENV = {
 	ENABLE_CLAUDEAI_MCP_SERVERS: "0",
 	DISABLE_AUTO_COMPACT: "1",
+} as const;
+
+// Added only to a mid-turn continuation query (see midTurnContinuation). This is
+// Claude Code's own mechanism for picking up a session whose last turn was cut
+// off with tool results pending — what a worker restart looks like to it. With
+// the flag set, a --resume whose transcript tail is a tool_result carrier runs
+// the model on RESUME_PROMPT as a meta user message and streams the reply.
+// Without it, CC materializes a synthetic "Continue from where you left off." /
+// "No response requested." exchange and then waits for a prompt on stdin; both
+// behaviors are pinned in tests/int-cc-contracts.mjs. Per-query rather than in
+// CC_CHILD_ENV: a plain rebuild after an abort can leave the same tail shape,
+// and there CC running a turn the user never asked for would be wrong.
+const CC_RESUME_INTERRUPTED_TURN_ENV = {
+	CLAUDE_CODE_RESUME_INTERRUPTED_TURN: "1",
+	CLAUDE_CODE_RESUME_REASON: "pi_compaction",
+	CLAUDE_CODE_RESUME_PROMPT: "Pi compacted this conversation's history to free context. Nothing new was asked: the tool results above are the latest state of the turn in progress. Continue that work from them now, taking the next step rather than describing it.",
 } as const;
 
 // Pi owns context files on the provider path, so Claude Code must not load its
@@ -829,6 +845,20 @@ let piUI: ExtensionUIContext | null = null;
 let piMode: ExtensionContext["mode"] | null = null;
 const activeQueryContexts = new Set<QueryContext>();
 
+// Set by session_compact when pi compacted in the middle of a tool loop, so the
+// next provider call — which arrives carrying that loop's latest tool results,
+// not a user prompt — starts a fresh query instead of ending the turn as an
+// orphaned result. Pi 0.85 compacts between a tool result and the next
+// assistant response (AgentSession._compactBeforeNextAssistantResponse), which
+// the pre-0.85 bridge never saw: compaction only ran at turn boundaries, where
+// syncSharedSession's rebuild picks the new history up naturally. Mid-turn, the
+// live Claude Code process still holds the pre-compaction transcript, and
+// delivering the results into it keeps every later request at full size — so
+// pi compacts again after each tool step, an isolated summary of the whole
+// history each time, and the context never shrinks. Holds the reason for the
+// log; consumed by the first provider call after it is set.
+let midTurnContinuation: string | null = null;
+
 // Defaults that silently cost the user something (no Opus 1M on Max, no
 // AskClaude tool) are announced once. Deferred to the first bridge query rather
 // than session_start: the notice persists a flag to the global config, and
@@ -1527,11 +1557,18 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		return stream;
 	}
 
+	// A tool result with no live query to take it is either an orphan (below) or
+	// the turn pi compacted underneath us, whose query the session_compact
+	// handler already tore down. Consumed here whatever the outcome: a stale flag
+	// must not turn a later orphan into a query.
+	const continuation = lastMsgRole === "toolResult" ? midTurnContinuation : null;
+	midTurnContinuation = null;
+
 	// --- Orphaned tool result (e.g. user aborted a tool call) ---
 	// The query is gone but pi still delivered the result. Nothing to do — just
 	// emit end_turn so pi waits for the next real user message.
 	const lastMsg = context.messages[context.messages.length - 1];
-	if (lastMsg?.role === "toolResult") {
+	if (lastMsg?.role === "toolResult" && !continuation) {
 		debug(`provider: orphaned tool result after abort, emitting end_turn`);
 		if (sharedSession && activeQueryContexts.size === 0) sharedSession.cursor = context.messages.length;
 		// No query owns this result, so there is no context to reset: resetTurnState
@@ -1592,9 +1629,30 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	const promptBlocks = extractUserPromptBlocks(context.messages);
 	let promptText = extractUserPrompt(context.messages) ?? "";
 
+	// Mid-turn continuation: the rebuild above wrote pi's compacted history, tool
+	// results and all, so the transcript now ends on a tool_result carrier. With
+	// CC_RESUME_INTERRUPTED_TURN_ENV set, Claude Code treats that as an interrupted
+	// turn and continues it itself on the resume prompt — so no prompt is pushed;
+	// the parked input generator is exactly what it needs (a pushed prompt would
+	// run as a second turn after the resumed one). The tail has to be a real
+	// tool_use/tool_result pair for CC to see an interrupted turn: if conversion
+	// could not produce one there is nothing for CC to resume and it would wait on
+	// stdin forever, so fall back to sending the resume text as an ordinary
+	// prompt, which still continues the work behind CC's synthetic exchange.
+	let resumeInterruptedTurn = false;
+	if (continuation) {
+		resumeInterruptedTurn = hasRebuildableToolTail(context.messages);
+		if (resumeInterruptedTurn) {
+			debug(`provider: mid-turn continuation (${continuation}) — resuming ${resumeSessionId?.slice(0, 8) ?? "none"} as an interrupted turn, no prompt pushed`);
+		} else {
+			debug(`WARNING: mid-turn continuation (${continuation}) but history does not end on a tool_use/tool_result pair; sending the resume text as a prompt instead`);
+			promptText = CC_RESUME_INTERRUPTED_TURN_ENV.CLAUDE_CODE_RESUME_PROMPT;
+		}
+	}
+
 	// Guard: empty prompt means the last context message isn't a user message.
 	// This should never happen with per-query state — dump diagnostics if it does.
-	if (!promptText && !promptBlocks) {
+	if (!promptText && !promptBlocks && !resumeInterruptedTurn) {
 		diagDump("empty_prompt", {
 			contextLength: context.messages.length,
 			lastMsgRole: lastMsg?.role,
@@ -1614,10 +1672,25 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// first result — consumeQuery ends the stream explicitly instead, or the
 	// query would never terminate.
 	const promptStream = makePromptStream();
-	void promptStream.push(userMessage(promptBlocks ?? [{ type: "text", text: promptText }]))
-		.catch((error) => debug(`provider: initial prompt push rejected:`, error));
+	if (!resumeInterruptedTurn) {
+		void promptStream.push(userMessage(promptBlocks ?? [{ type: "text", text: promptText }]))
+			.catch((error) => debug(`provider: initial prompt push rejected:`, error));
+	}
 	queryCtx.promptStream = promptStream;
 	const mcpServers = buildMcpServers(mcpTools, queryCtx);
+	// Claude Code's interrupted-turn resume fires its API request as soon as
+	// startup settles, without waiting for SDK MCP servers to answer tools/list;
+	// an answer that lands even ~100ms late leaves the resumed turn with no
+	// tools, and the model ends it having only thought about the call it meant to
+	// make. Our server answers from pi's event loop, which is busy right after a
+	// compaction, so this was lost about a third of the time. CC does run
+	// UserPromptSubmit hooks for the resume prompt and blocks on them, so the hook
+	// holds the request until the listing has been served. Pinned in
+	// tests/int-cc-contracts.mjs; the cap only guards against a listing that
+	// never comes, in which case the turn proceeds as it would have anyway.
+	const continuationHooks = resumeInterruptedTurn && mcpServers
+		? { UserPromptSubmit: [{ hooks: [makeToolListingGate(mcpServers[MCP_SERVER_NAME].listed)] }] }
+		: undefined;
 
 	// MCP auto-loading suppression: CC reads MCP servers from ~/.claude.json (top-level
 	// + per-project) and .mcp.json. Since pi executes tools (not CC), those are pure
@@ -1651,7 +1724,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// also autocompact would double-flush the prompt cache and races pi's
 	// threshold with CC's, including CC's anti-thrashing guard (issue #8).
 	// Manual /compact in CC still works (we never invoke it).
-	const childEnv = { ...process.env, ...CC_CHILD_ENV };
+	const childEnv = { ...process.env, ...CC_CHILD_ENV, ...(resumeInterruptedTurn ? CC_RESUME_INTERRUPTED_TURN_ENV : {}) };
 	const queryOptions: NonNullable<Parameters<typeof query>[0]["options"]> = {
 		cwd,
 		env: childEnv,
@@ -1679,6 +1752,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		extraArgs,
 		...(effort ? { effort } : {}),
 		...(mcpServers ? { mcpServers } : {}),
+		...(continuationHooks ? { hooks: continuationHooks } : {}),
 		...(resumeSessionId ? { resume: resumeSessionId } : {}),
 		...(claudeExecutable ? { pathToClaudeCodeExecutable: claudeExecutable } : {}),
 		...makeCliDebugOptions("provider"),
@@ -1687,6 +1761,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	debug("provider: fresh query",
 		`model=${cliModel} msgs=${context.messages.length} tools=${mcpTools.length}`,
 		`resume=${resumeSessionId?.slice(0, 8) ?? "none"} effort=${effort ?? "default"}`,
+		`mode=${resumeInterruptedTurn ? "interrupted-turn" : "prompt"}`,
 		`ctxFiles=${promptCapture?.contextFiles.length ?? 0} strictMcp=${strictMcpConfigEnabled}`,
 		`prompt=${promptText.slice(0, 60)}${promptBlocks ? " [+images]" : ""}`);
 
@@ -1716,7 +1791,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	}
 
 	// Background consumer — runs until query ends
-	consumeQuery(sdkQuery, customToolNameToPi, model, () => wasAborted, queryCtx)
+	const done = consumeQuery(sdkQuery, customToolNameToPi, model, () => wasAborted, queryCtx)
 		.then(async ({ capturedSessionId }) => {
 			debug(`provider: consumeQuery completed, stopReason=${queryCtx.turnOutput?.stopReason}, error=${queryCtx.turnOutput?.errorMessage}, aborted=${wasAborted}`);
 
@@ -1797,12 +1872,77 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			if (queryCtx.activeQuery === sdkQuery || queryCtx.activeQuery === null) {
 				queryCtx.releasePendingToolCalls("Query ended");
 				queryCtx.activeQuery = null;
+				queryCtx.teardown = null;
 				activeQueryContexts.delete(queryCtx);
 			}
 			sdkQuery.close();
 		});
+	// The abort path already settles everything a dying query leaves behind and
+	// marks the session for a rotated rebuild, which is what a compaction
+	// underneath the query needs too. `done` resolves after the finally above, so
+	// an awaiting caller sees the context out of activeQueryContexts.
+	queryCtx.teardown = () => { onAbort(); return done; };
 
 	return stream;
+}
+
+const TOOL_LISTING_GATE_CAP_MS = 10_000;
+
+/** A UserPromptSubmit hook that lets the prompt through once `listed` has
+ *  resolved, or after the cap. Fires for every prompt of the query, so later
+ *  steers pass straight through. */
+function makeToolListingGate(listed: Promise<void>): HookCallback {
+	return async () => {
+		const started = Date.now();
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const capped = await Promise.race([
+			listed.then(() => false),
+			new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(true), TOOL_LISTING_GATE_CAP_MS); }),
+		]);
+		clearTimeout(timer);
+		const waited = Date.now() - started;
+		if (capped) debug(`WARNING: continuation prompt released after ${waited}ms without a tools/list from Claude Code — the resumed turn may run without tools`);
+		else debug(`provider: continuation prompt gate: tools/list ${waited > 0 ? `served after ${waited}ms` : "already served"}, releasing prompt`);
+		return { continue: true };
+	};
+}
+
+/** Whether pi's history ends on tool results whose assistant message the rebuild
+ *  will replay as a tool_use turn — the shape Claude Code's interrupted-turn
+ *  resume looks for. convertPiMessages drops an assistant message with no content
+ *  at all (an aborted turn), and a result behind one of those would be repaired
+ *  into nothing CC can continue. */
+function hasRebuildableToolTail(messages: Context["messages"]): boolean {
+	let i = messages.length - 1;
+	if (i < 0 || messages[i].role !== "toolResult") return false;
+	while (i >= 0 && messages[i].role !== "assistant") i--;
+	if (i < 0) return false;
+	const content = messages[i].content;
+	return Array.isArray(content) && content.some((block) => block.type === "toolCall");
+}
+
+/** Kill the top-level query pi has just compacted underneath. Its Claude Code
+ *  process holds the pre-compaction transcript and is parked in an MCP handler
+ *  waiting for tool results; releasing it lets the next provider call rebuild a
+ *  session from the compacted history instead. No-op when nothing is live — a
+ *  /compact at a turn boundary, or auto-compaction before a new prompt. */
+async function tearDownLiveQueryForCompaction(label: string): Promise<void> {
+	const c = ctx();
+	if (!c.teardown) return;
+	debug(`${label}: tearing down live query (pendingToolCalls=${c.pendingToolCalls.size}) — its Claude Code process holds the pre-compaction transcript`);
+	await c.teardown();
+	debug(`${label}: live query released, activeContexts=${activeQueryContexts.size}`);
+}
+
+/** Whether the session branch, after compaction, ends on a tool result — i.e.
+ *  pi compacted inside a tool loop and will call the provider next to continue
+ *  that loop rather than with a user prompt. */
+function branchEndsOnToolResult(branch: ReadonlyArray<{ type: string; message?: { role?: string } }>): boolean {
+	for (let i = branch.length - 1; i >= 0; i--) {
+		const entry = branch[i];
+		if (entry.type === "message") return entry.message?.role === "toolResult";
+	}
+	return false;
 }
 
 // --- AskClaude: prompt and wait ---
@@ -2026,6 +2166,7 @@ export default function (pi: ExtensionAPI) {
 		debug(`${event}: clearing session ${sharedSession?.sessionId?.slice(0, 8) ?? "none"}`);
 		sharedSession = null;
 		promptCaptures.clear();
+		midTurnContinuation = null;
 
 		// Clear the global streamSimple if this instance registered it.
 		// This allows /reload to work — the old instance clears the flag so
@@ -2130,7 +2271,23 @@ export default function (pi: ExtensionAPI) {
 			sharedSession = { ...sharedSession, needsRebuild: true };
 		}
 	};
-	pi.on("session_compact", (event) => markRebuild(`session_compact:${event.reason}:willRetry=${event.willRetry}`));
+	//
+	// Pi 0.85 also compacts inside a tool loop, between a tool result and the
+	// next assistant response. The live Claude Code process is then a liability:
+	// it holds the pre-compaction transcript, and feeding it the tool results
+	// would keep every later request at full size. Kill it here, and tell the
+	// next provider call — which arrives carrying those tool results — to start a
+	// query from the rebuilt history instead of treating them as orphans. The
+	// overflow-retry compaction (willRetry) continues the turn the same way after
+	// CC's own request failed on context size.
+	pi.on("session_compact", async (event, ctx) => {
+		const label = `session_compact:${event.reason}:willRetry=${event.willRetry}`;
+		markRebuild(label);
+		await tearDownLiveQueryForCompaction(label);
+		const midTurn = event.willRetry || branchEndsOnToolResult(ctx.sessionManager.getBranch());
+		midTurnContinuation = midTurn ? label : null;
+		if (midTurn) debug(`${label}: history ends inside a tool loop — next provider call continues the turn from the rebuilt session`);
+	});
 	pi.on("session_tree", () => markRebuild("session_tree"));
 
 	// Branch summarization — rewind or fork-at-point with "summarize" — is the other

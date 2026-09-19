@@ -28,6 +28,11 @@ export class QueryContext {
 	turnToolCallIds: string[] = [];
 	/** Streaming-input handle for the active query — how steers reach CC mid-turn. */
 	promptStream: PromptStream | null = null;
+	/** Kill the active query as if the user had aborted it, resolving once its state
+	 *  is released from the routing set. Installed by the provider for the lifetime
+	 *  of a query; the session_compact handler uses it to drop a Claude Code process
+	 *  whose transcript pi has just compacted out from under it. */
+	teardown: (() => Promise<void>) | null = null;
 	/** Last rate-limit rejection seen on this query. Claude Code sends it just before the
 	 *  failure it caused, which is the only thing tying the two together. */
 	rateLimitRejection: { rateLimitType?: string; resetsAt?: number } | null = null;

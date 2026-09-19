@@ -432,7 +432,168 @@ test("repairToolPairing keeps every result only when they share one user message
 		`repairToolPairing now tolerates split results (${JSON.stringify(split)}) — convertPiMessages could stop collecting them`);
 });
 
+// --- Resuming a session cut off inside a tool loop ---
+//
+// After a mid-turn compaction the bridge rebuilds Claude Code's session from pi's
+// compacted history, so the transcript ends on the tool results of the turn in
+// progress with no assistant reply. These two pin what CC does with that tail.
+
+/** A transcript that ends on an answered tool call: a turn cut off before the model replied. */
+function seedToolResultTail() {
+	const sessionId = randomUUID();
+	const session = createSession({ sessionId, projectPath: CWD, claudeDir: process.env.CLAUDE_CONFIG_DIR, model: MODEL });
+	session.importMessages(repairToolPairing([
+		{ role: "user", content: "Read the vault file and tell me the code, then say DONE." },
+		{ role: "assistant", content: [{ type: "tool_use", id: "pi_call_tail", name: "mcp__custom-tools__read", input: { path: "/tmp/vault.txt" } }] },
+		{ role: "user", content: [{ type: "tool_result", tool_use_id: "pi_call_tail", content: "The vault code is PLATYPUS." }] },
+	]));
+	session.save();
+	const before = readFileSync(session.jsonlPath, "utf8").trim().split("\n").length;
+	return { sessionId, jsonlPath: session.jsonlPath, before };
+}
+
+/** user/assistant records CC appended past `before`, as `role:text`. */
+function appendedTurns({ jsonlPath, before }) {
+	return readFileSync(jsonlPath, "utf8").trim().split("\n").slice(before).map((line) => JSON.parse(line))
+		.filter((r) => r.type === "user" || r.type === "assistant")
+		.map((r) => `${r.type}${r.isMeta ? "(meta)" : ""}:${(r.message?.content ?? []).map((b) => b.type === "text" ? b.text : b.type).join("+")}`);
+}
+
+test("a --resume onto a tool_result tail materializes a synthetic exchange before the prompt", { timeout: 120_000 }, async () => {
+	// The default: CC repairs the tail with a synthetic user "Continue from where
+	// you left off." and assistant "No response requested.", then runs our prompt
+	// after them. Both land in the model's context. This is what the bridge's
+	// continuation path avoids by not sending a prompt at all (next test).
+	const seeded = seedToolResultTail();
+	const { result } = await collect(query({
+		prompt: "Continue.",
+		options: providerOptions({ resume: seeded.sessionId, maxTurns: 2 }),
+	}));
+	assert.equal(result?.subtype, "success");
+	const turns = appendedTurns(seeded);
+	assert.deepEqual(turns.slice(0, 3), [
+		"user(meta):Continue from where you left off.",
+		"assistant:No response requested.",
+		"user:Continue.",
+	], `CC's tool_result-tail repair changed shape: ${JSON.stringify(turns)}`);
+});
+
+test("CLAUDE_CODE_RESUME_INTERRUPTED_TURN=1 continues a tool_result tail on the resume prompt with no input", { timeout: 120_000 }, async () => {
+	// The bridge's continuation path: the flag makes CC treat the tail as an
+	// interrupted turn and run the model on CLAUDE_CODE_RESUME_PROMPT itself, as a
+	// meta user message, while the streamed input stays parked. No synthetic
+	// exchange, and the reply reflects the tool result. The input generator only
+	// ends once the result arrives, as the bridge's parked prompt stream does.
+	const seeded = seedToolResultTail();
+	const RESUME_PROMPT = "[contract] Compacted mid-turn. Continue from the tool results above.";
+	let release;
+	const parked = new Promise((resolve) => { release = resolve; });
+	async function* parkedInput() { await parked; }
+	let text = "";
+	let result = null;
+	const q = query({
+		prompt: parkedInput(),
+		options: providerOptions({
+			resume: seeded.sessionId, maxTurns: 2,
+			env: { ...process.env, ENABLE_CLAUDEAI_MCP_SERVERS: "0", DISABLE_AUTO_COMPACT: "1", CLAUDE_CODE_RESUME_INTERRUPTED_TURN: "1", CLAUDE_CODE_RESUME_PROMPT: RESUME_PROMPT },
+		}),
+	});
+	try {
+		for await (const message of q) {
+			if (message.type === "assistant") for (const block of message.message?.content ?? []) if (block.type === "text") text += block.text;
+			if (message.type === "result") { result = message; release(); break; }
+		}
+	} finally {
+		release();
+		q.close();
+	}
+	assert.equal(result?.subtype, "success", `resume did not run a turn on its own: ${JSON.stringify(result)}`);
+	assert.match(text, /platypus/i, `resumed turn did not use the tool result: ${text}`);
+	const turns = appendedTurns(seeded);
+	assert.equal(turns[0], `user(meta):${RESUME_PROMPT}`, `resume prompt was not the first appended turn, or not meta: ${JSON.stringify(turns)}`);
+	assert.ok(!turns.some((t) => t.includes("No response requested.") || t.includes("Continue from where you left off.")),
+		`CC still materialized its synthetic exchange: ${JSON.stringify(turns)}`);
+});
+
 // --- Environment suppression ---
+
+/** Resume a tool_result tail in interrupted-turn mode against an MCP server
+ *  whose tools/list answer is delayed. The seeded turn still owes a `beta` call,
+ *  so whether the resumed turn can make it shows whether the tools reached the
+ *  request. `gate` installs the UserPromptSubmit hook the bridge uses. */
+async function resumeAgainstDelayedListing({ gate, listDelayMs }) {
+	const sessionId = randomUUID();
+	const session = createSession({ sessionId, projectPath: CWD, claudeDir: process.env.CLAUDE_CONFIG_DIR, model: MODEL });
+	session.importMessages(repairToolPairing([
+		{ role: "user", content: "Call the alpha tool, then call the beta tool, then reply with both values and the word DONE." },
+		{ role: "assistant", content: [{ type: "tool_use", id: "pi_call_alpha", name: "mcp__custom-tools__alpha", input: {} }] },
+		{ role: "user", content: [{ type: "tool_result", tool_use_id: "pi_call_alpha", content: "alpha-VALUE" }] },
+	]));
+	session.save();
+
+	const calls = [];
+	let markListed;
+	const listed = new Promise((resolve) => { markListed = resolve; });
+	const server = new McpServer({ name: "custom-tools", version: "1.0.0" }, { capabilities: { tools: {} } });
+	server.server.setRequestHandler(ListToolsRequestSchema, async () => {
+		await new Promise((resolve) => setTimeout(resolve, listDelayMs));
+		markListed();
+		return { tools: [noArgTool("alpha"), noArgTool("beta")] };
+	});
+	server.server.setRequestHandler(CallToolRequestSchema, async (request) => {
+		calls.push(request.params.name);
+		return { content: [{ type: "text", text: `${request.params.name}-VALUE` }] };
+	});
+
+	let release;
+	const parked = new Promise((resolve) => { release = resolve; });
+	async function* parkedInput() { await parked; }
+	let init = null;
+	let result = null;
+	const q = query({
+		prompt: parkedInput(),
+		options: providerOptions({
+			resume: sessionId, maxTurns: 4,
+			mcpServers: { "custom-tools": { type: "sdk", name: "custom-tools", instance: server } },
+			...(gate ? { hooks: { UserPromptSubmit: [{ hooks: [async () => { await listed; return { continue: true }; }] }] } } : {}),
+			env: { ...process.env, ENABLE_CLAUDEAI_MCP_SERVERS: "0", DISABLE_AUTO_COMPACT: "1", CLAUDE_CODE_RESUME_INTERRUPTED_TURN: "1", CLAUDE_CODE_RESUME_PROMPT: "[contract] Compacted mid-turn. Continue from the tool results above, taking the next step." },
+		}),
+	});
+	try {
+		for await (const message of q) {
+			if (message.type === "system" && message.subtype === "init") init = message;
+			if (message.type === "result") { result = message; release(); break; }
+		}
+	} finally {
+		release();
+		q.close();
+	}
+	return { init, result, calls };
+}
+
+test("the interrupted-turn resume does not wait for an SDK MCP server's tools/list", { timeout: 120_000 }, async () => {
+	// The reason the bridge gates its continuation query: CC builds the resumed
+	// turn's request as soon as startup settles. A tools/list answer that is not
+	// in by then is simply absent from the tool pool — init reports no servers —
+	// and the model cannot make the call the turn still owes. Deterministic at
+	// this delay; the bridge's in-process server loses the same race whenever pi's
+	// event loop is busy for ~100ms at the wrong moment.
+	const { init, result, calls } = await resumeAgainstDelayedListing({ gate: false, listDelayMs: 600 });
+	assert.equal(result?.subtype, "success");
+	assert.deepEqual(init?.mcp_servers, [], `CC now waits for a slow SDK MCP listing on resume: ${JSON.stringify(init?.mcp_servers)} — the continuation gate may be unnecessary`);
+	assert.ok(!calls.includes("beta"), `resumed turn called beta without the listing in its tool pool: ${JSON.stringify(calls)}`);
+});
+
+test("a UserPromptSubmit hook holds the resumed turn until the tools/list has been served", { timeout: 120_000 }, async () => {
+	// CC runs UserPromptSubmit hooks for its own resume prompt and blocks on
+	// them, which is the only startup point found that the SDK can hold. With
+	// the gate, init sees the server connected and the resumed turn makes the call.
+	// (SessionStart callbacks registered through the SDK never fired on this path.)
+	const { init, result, calls } = await resumeAgainstDelayedListing({ gate: true, listDelayMs: 600 });
+	assert.equal(result?.subtype, "success");
+	assert.deepEqual(init?.mcp_servers, [{ name: "custom-tools", status: "connected" }], `gate did not hold the request for the listing: ${JSON.stringify(init?.mcp_servers)}`);
+	assert.ok(calls.includes("beta"), `resumed turn did not call beta despite the gate: ${JSON.stringify(calls)}`);
+});
 
 test("ENABLE_CLAUDEAI_MCP_SERVERS=0 suppresses claude.ai cloud MCP servers", { timeout: 120_000 }, async (t) => {
 	// Cloud servers are a separate code path from filesystem MCP and are blocked
