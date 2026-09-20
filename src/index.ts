@@ -2267,7 +2267,23 @@ export default function (pi: ExtensionAPI) {
 		lastSystemPromptOptions = event.systemPromptOptions;
 		basePromptBeforeHandlers = event.systemPrompt;
 		wakePrompt = undefined;
-		if (lastSystemPromptOptions) recordSystemPrompt(event.systemPrompt, lastSystemPromptOptions);
+		if (lastSystemPromptOptions) {
+			// Earlier extensions may already have wrapped Pi's base via the legacy
+			// systemPrompt return. The event getter renders these mutable options:
+			// capture the underlying base before recording the wrapper, so it is
+			// projected as Pi-owned scaffolding, not forwarded as custom policy.
+			const forced = lastSystemPromptOptions.forceSystemPrompt;
+			if (forced !== undefined) {
+				try {
+					lastSystemPromptOptions.forceSystemPrompt = undefined;
+					basePromptBeforeHandlers = event.systemPrompt;
+					recordSystemPrompt(basePromptBeforeHandlers, lastSystemPromptOptions);
+				} finally {
+					lastSystemPromptOptions.forceSystemPrompt = forced;
+				}
+			}
+			recordSystemPrompt(event.systemPrompt, lastSystemPromptOptions);
+		}
 	});
 	// Pi 0.86 can widen tools and mutate prompt options after our start hook.
 	// Capture the finalized prompt before every request. On a post-reload wake

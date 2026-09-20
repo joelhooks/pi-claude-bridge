@@ -50,6 +50,19 @@ describe("Pi 0.86 finalized prompt capture", () => {
 		assert.equal(__test.resolveProviderCapture(undefined), undefined);
 	});
 
+	it("projects the base when an earlier extension already forced a wrapped prompt", () => {
+		const h = setup(); const opts = options(); const base = buildSystemPrompt(opts);
+		opts.forceSystemPrompt = `${base}\n\nEARLY-EXTENSION-POLICY`;
+		const forced = opts.forceSystemPrompt;
+		// Real Pi exposes a getter that re-renders the shared mutable options.
+		h.get("before_agent_start")({ get systemPrompt() { return buildSystemPrompt(opts); }, systemPromptOptions: opts });
+		h.get("agent_start")({}, { getSystemPrompt: () => buildSystemPrompt(opts) });
+		const result = project(forced);
+		assert.equal(opts.forceSystemPrompt, forced, "must not change the prompt seen by other extensions");
+		for (const text of ["PROJECT-POLICY", "CLI-POLICY", "EARLY-EXTENSION-POLICY"]) assert.ok(result.includes(text));
+		assert.doesNotMatch(result, /operating inside pi|Pi documentation/);
+	});
+
 	it("preserves a standalone full replacement instead of resurrecting old policy", () => {
 		const h = setup(); const opts = options();
 		h.get("before_agent_start")({ systemPrompt: buildSystemPrompt(opts), systemPromptOptions: opts });
