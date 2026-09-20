@@ -22,7 +22,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createRpcHarness } from "./lib/rpc-harness.mjs";
 
-const BRIDGE_MODEL = "claude-bridge/claude-haiku-4-5";
+const BRIDGE_MODEL = process.env.BRIDGE_TEST_MODEL ?? "claude-bridge/claude-haiku-4-5";
 const COMPACT_TIMEOUT = 120_000;
 const TEST_TIMEOUT = 300_000;
 
@@ -34,7 +34,7 @@ writeFileSync(join(testAgentDir, "settings.json"), JSON.stringify({
 
 const harness = createRpcHarness({
 	name: "compact-midturn",
-	args: ["--model", BRIDGE_MODEL],
+	args: ["--model", BRIDGE_MODEL, "--no-context-files", "--no-skills", "--no-prompt-templates"],
 	env: { PI_CODING_AGENT_DIR: testAgentDir },
 	defaultTimeout: TEST_TIMEOUT,
 });

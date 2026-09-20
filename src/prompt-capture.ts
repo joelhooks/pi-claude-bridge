@@ -199,7 +199,7 @@ export class PromptCaptures {
 	 * silently discarding policy the user wrote down. A failed turn is recoverable;
 	 * a turn that quietly ignored its instructions is not.
 	 */
-	resolveOrDerive(systemPrompt?: string): PromptCapture | undefined {
+	resolveOrDerive(systemPrompt?: string, transcriptParts?: readonly string[]): PromptCapture | undefined {
 		if (!systemPrompt) return undefined;
 		const exact = this.captures.get(systemPrompt);
 		if (exact) {
@@ -235,6 +235,20 @@ export class PromptCaptures {
 		if (baseMatch) {
 			this.touch(baseMatch.assembledPrompt, baseMatch);
 			return baseMatch;
+		}
+
+		// Pi's builder renders sections in canonical order, while transcript replay
+		// keeps insertion order after deletions/re-additions. Match only the exact
+		// same whole section values, never a prefix or changed instruction. Keep
+		// Pi's native replay order intact rather than sorting the provider input.
+		if (transcriptParts?.length && transcriptParts.join("\n\n") === systemPrompt) {
+			const equivalent = this.newestCapture(reachable.filter((node) =>
+				isExactPartPermutation(node.assembledPrompt, transcriptParts),
+			));
+			if (equivalent) {
+				this.touch(equivalent.assembledPrompt, equivalent);
+				return equivalent;
+			}
 		}
 
 		const embedded = this.findInheritedPrompts(systemPrompt, systemPrompt);
@@ -328,6 +342,23 @@ export class PromptCaptures {
 		for (const capture of this.captures.values()) visit(capture);
 		return result;
 	}
+}
+
+/** Only complete, non-empty parts separated by Pi's exact separator may move. */
+function isExactPartPermutation(prompt: string, parts: readonly string[]): boolean {
+	const remaining = [...parts].sort((a, b) => b.length - a.length);
+	let rest = prompt;
+	while (remaining.length > 0) {
+		const index = remaining.findIndex((part) => rest === part || rest.startsWith(`${part}\n\n`));
+		if (index === -1) return false;
+		const [part] = remaining.splice(index, 1);
+		rest = rest.slice(part.length);
+		if (remaining.length > 0) {
+			if (!rest.startsWith("\n\n")) return false;
+			rest = rest.slice(2);
+		}
+	}
+	return rest.length === 0;
 }
 
 export function projectPromptCapture(

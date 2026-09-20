@@ -1,7 +1,7 @@
 import { calculateCost, StringEnum, type AssistantMessage, type AssistantMessageEventStream, type Context, type ImageContent, type Model, type SimpleStreamOptions, type TextContent, type Tool, type UserMessage } from "@earendil-works/pi-ai";
 import * as piAi from "@earendil-works/pi-ai";
 import { getModels } from "@earendil-works/pi-ai/compat";
-import { buildSessionContext, compact, generateBranchSummary, keyHint, type BranchSummaryResult, type CompactionEntry, type ExtensionAPI, type ExtensionContext, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import { buildSessionContext, compact, generateBranchSummary, keyHint, type BranchSummaryResult, type BuildSystemPromptOptions, type CompactionEntry, type ExtensionAPI, type ExtensionContext, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { query, type EffortLevel, type HookCallback, type SDKMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import type { Base64ImageSource, ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { Type } from "typebox";
@@ -28,6 +28,7 @@ import {
 import { collectCarriedAttachments, placeCarriedAttachments, type CarriedAttachment } from "./attachments.js";
 import { createToolServer } from "./mcp-server.js";
 import { buildActionSummary, type ToolCallState } from "./askclaude-ui.js";
+import { nonSystemMessages, toBridgeContext, transcriptPromptParts } from "./transcript.js";
 
 // Compat (#2): use factory if available (pi-ai ≥0.66), else fall back to constructor (gsd-pi etc.)
 const _piAi = piAi as any;
@@ -469,6 +470,12 @@ function describeRateLimitFailure(rejection: { rateLimitType?: string; resetsAt?
 	return `Claude rate limit${kind}${resets}: ${failure}`;
 }
 
+function isOneOffSummary(context: Context, options?: SimpleStreamOptions): boolean {
+	return options?.cacheRetention === "none"
+		&& (context.tools?.length ?? 0) === 0
+		&& context.messages.length === 1 && context.messages[0].role === "user";
+}
+
 function isolatedStreamFn(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
 	const stream = newAssistantMessageEventStream();
 	void runIsolatedSummary(model, context, options, stream);
@@ -490,6 +497,7 @@ async function runIsolatedSummary(
 	};
 
 	try {
+		context = toBridgeContext(context);
 		const promptText = extractIsolatedSummaryPrompt(context.messages);
 		const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
 		const compactProviderSettings = loadConfig(cwd).provider;
@@ -673,7 +681,8 @@ function syncSharedSession(
 	customToolNameToSdk?: Map<string, string>,
 	modelId?: string,
 ): SyncResult {
-	const priorMessages = messages.slice(0, turnStart(messages)); // everything before the current user turn
+	const history = nonSystemMessages(messages);
+	const priorMessages = history.slice(0, turnStart(history)); // everything before the current user turn
 
 	// REUSE path
 	//
@@ -774,6 +783,12 @@ export const __test = {
 		piUI = ui;
 	},
 	syncSharedSession,
+	toBridgeContext,
+	resolveMcpTools,
+	extractIsolatedSummaryPrompt,
+	isOneOffSummary,
+	resolveProviderCapture,
+	get promptCaptures() { return promptCaptures; },
 	extractUserPromptBlocks,
 	consumeQuery,
 	finalizeCurrentStream,
@@ -884,7 +899,9 @@ function showStartupNoticeOnce(): void {
 // Captures of what pi assembled per agent; see src/prompt-capture.ts for why this
 // is keyed rather than held in a single slot.
 const PROMPT_CAPTURE_RELOAD_KEY = Symbol.for("@joelhooks/pi-claude-bridge/prompt-capture-reload-v1");
-type PromptCaptureReloadCarrier = { version: 1; captures: PromptCaptureSnapshot[] };
+type WakePrompt = { basePrompt: string; assembledPrompt: string };
+let wakePrompt: WakePrompt | undefined;
+type PromptCaptureReloadCarrier = { version: 1; captures: PromptCaptureSnapshot[]; wakePrompt?: WakePrompt };
 const promptCaptureReloadGlobals = () => globalThis as typeof globalThis & Record<symbol, unknown>;
 const isPromptCaptureReloadCarrier = (value: unknown): value is PromptCaptureReloadCarrier =>
 	typeof value === "object"
@@ -913,6 +930,14 @@ const promptCaptures = new PromptCaptures(256, (diagnostic) => {
  *  ack. The activeQueryContexts leak was present on every single happy-path run and
  *  no test noticed, because nothing asserted that anything ends clean — so assert it
  *  where the real sessions are, and let diag/audit-warnings.mjs scan for it. */
+function resolveProviderCapture(systemPrompt?: string, promptParts?: readonly string[]) {
+	// A wake skips before_agent_start and Pi restores the base prompt. Only the
+	// exact base recorded for this session may reuse the finalized policy.
+	const key = wakePrompt && systemPrompt === wakePrompt.basePrompt
+		? wakePrompt.assembledPrompt : systemPrompt;
+	return promptCaptures.resolveOrDerive(key, promptParts);
+}
+
 function reportLeaks(label: string): void {
 	const pendingCalls = [...activeQueryContexts].reduce((n, c) => n + c.pendingToolCalls.size, 0);
 	const liveStreams = [...activeQueryContexts].filter((c) => c.promptStream !== null).length;
@@ -1519,6 +1544,12 @@ function drainForAbort(c: QueryContext, promptStream: PromptStream): void {
  *  Two cases: tool result delivery (active query) or fresh query. */
 function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
 	showStartupNoticeOnce();
+	const promptParts = transcriptPromptParts(context);
+	context = toBridgeContext(context);
+	// Pi's one-off summarizers (including /bug) deliberately disable caching
+	// and carry one user request without tools. Never send them into the live
+	// Claude conversation or try to resolve them as a captured agent prompt.
+	if (isOneOffSummary(context, options)) return isolatedStreamFn(model, context, options);
 	const stream = newAssistantMessageEventStream();
 
 	// DEBUG: trace followUp message triggering
@@ -1601,7 +1632,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// `--no-skills` reach Claude Code by leaving nothing to forward. A sub-agent's
 	// custom override embeds its parent's assembled Pi prompt; recursive projection
 	// replaces that exact inherited prompt with its already-safe portable parts.
-	const promptCapture = promptCaptures.resolveOrDerive(context.systemPrompt);
+	const promptCapture = resolveProviderCapture(context.systemPrompt, promptParts);
 	const systemPromptAppend = promptCapture
 		? projectPromptCapture(promptCapture, {
 			skillReadTool: mcpTools.some((tool) => tool.name === "read") ? "mcp" : "none",
@@ -1917,8 +1948,8 @@ function hasRebuildableToolTail(messages: Context["messages"]): boolean {
 	if (i < 0 || messages[i].role !== "toolResult") return false;
 	while (i >= 0 && messages[i].role !== "assistant") i--;
 	if (i < 0) return false;
-	const content = messages[i].content;
-	return Array.isArray(content) && content.some((block) => block.type === "toolCall");
+	const assistant = messages[i];
+	return assistant.role === "assistant" && assistant.content.some((block) => block.type === "toolCall");
 }
 
 /** Kill the top-level query pi has just compacted underneath. Its Claude Code
@@ -2161,11 +2192,18 @@ export default function (pi: ExtensionAPI) {
 		if (config.askClaude?.enabled === undefined) pendingNotices.push("The AskClaude tool is opt-in only. Set askClaude.enabled to use it.");
 	}
 
+	// The event options remain mutable through later before_agent_start handlers.
+	let lastSystemPromptOptions: BuildSystemPromptOptions | undefined;
+	let basePromptBeforeHandlers: string | undefined;
+
 	// Reset shared session on pi session lifecycle events
 	const clearSession = (event: string) => {
 		debug(`${event}: clearing session ${sharedSession?.sessionId?.slice(0, 8) ?? "none"}`);
 		sharedSession = null;
 		promptCaptures.clear();
+		lastSystemPromptOptions = undefined;
+		basePromptBeforeHandlers = undefined;
+		wakePrompt = undefined;
 		midTurnContinuation = null;
 
 		// Clear the global streamSimple if this instance registered it.
@@ -2186,6 +2224,7 @@ export default function (pi: ExtensionAPI) {
 			delete globals[PROMPT_CAPTURE_RELOAD_KEY];
 			if (isPromptCaptureReloadCarrier(carrier)) {
 				promptCaptures.restore(carrier.captures);
+				wakePrompt = carrier.wakePrompt;
 				debug(`session_start:reload: restored ${carrier.captures.length} prompt captures`);
 			}
 		} else {
@@ -2198,25 +2237,60 @@ export default function (pi: ExtensionAPI) {
 	// `--system-prompt` replaces pi's default rather than adding to it, but Claude
 	// Code's preset carries its own tool and permission guidance that the bridge
 	// still depends on, so both flags are forwarded as an append.
-	pi.on("before_agent_start", (event) => {
-		const options = event.systemPromptOptions;
-		const hasRead = !options?.selectedTools || options.selectedTools.includes("read");
-		promptCaptures.record(event.systemPrompt, {
-			custom: options?.customPrompt,
-			append: options?.appendSystemPrompt,
-			baseSystemPromptLengths: options
-				? findBaseSystemPromptLengths(event.systemPrompt, options.cwd)
-				: undefined,
-			contextFiles: options?.contextFiles ?? [],
-			skills: hasRead ? options?.skills ?? [] : [],
+	function recordSystemPrompt(systemPrompt: string, options: BuildSystemPromptOptions): void {
+		// A full replacement owns its instructions. When it wraps an earlier
+		// capture, the existing inheritance graph projects that embedded prompt.
+		if (options.forceSystemPrompt !== undefined) {
+			if (!promptCaptures.resolve(systemPrompt)) {
+				promptCaptures.record(systemPrompt, { custom: systemPrompt, contextFiles: [], skills: [] });
+			}
+			return;
+		}
+		const selectedTools = pi.getActiveTools?.() ?? options.selectedTools;
+		const hasRead = !selectedTools || selectedTools.includes("read");
+		const additions = [
+			options.appendSystemPrompt,
+			...(options.promptGuidelines ?? []),
+			...(selectedTools ?? []).flatMap((name) => options.toolGuidelines?.[name] ?? []),
+			...Object.entries(options.sections ?? {}).filter(([, text]) => text)
+				.map(([name, text]) => `<${name}>\n${text}\n</${name}>`),
+		].filter(Boolean).join("\n\n");
+		promptCaptures.record(systemPrompt, {
+			custom: options.customPrompt,
+			append: additions || undefined,
+			baseSystemPromptLengths: findBaseSystemPromptLengths(systemPrompt, options.cwd),
+			contextFiles: options.contextFiles ?? [],
+			skills: hasRead ? options.skills ?? [] : [],
 		});
+	}
+	pi.on("before_agent_start", (event) => {
+		lastSystemPromptOptions = event.systemPromptOptions;
+		basePromptBeforeHandlers = event.systemPrompt;
+		wakePrompt = undefined;
+		if (lastSystemPromptOptions) recordSystemPrompt(event.systemPrompt, lastSystemPromptOptions);
 	});
+	// Pi 0.86 can widen tools and mutate prompt options after our start hook.
+	// Capture the finalized prompt before every request. On a post-reload wake
+	// there are no fresh options: retain the restored graph instead of wiping it.
+	const captureCurrentPrompt = (_event: unknown, ctx: ExtensionContext) => {
+		if (lastSystemPromptOptions) {
+			const assembledPrompt = ctx.getSystemPrompt();
+			recordSystemPrompt(assembledPrompt, lastSystemPromptOptions);
+			if (basePromptBeforeHandlers !== undefined) {
+				wakePrompt = { basePrompt: basePromptBeforeHandlers, assembledPrompt };
+			}
+		}
+	};
+	pi.on("agent_start", captureCurrentPrompt);
+	pi.on("turn_start", captureCurrentPrompt);
+	pi.on("agent_end", () => { lastSystemPromptOptions = undefined; });
 	pi.on("session_shutdown", (event) => {
 		const globals = promptCaptureReloadGlobals();
 		if (event.reason === "reload") {
 			globals[PROMPT_CAPTURE_RELOAD_KEY] = {
 				version: 1,
 				captures: promptCaptures.snapshot(),
+				wakePrompt,
 			} satisfies PromptCaptureReloadCarrier;
 		} else {
 			delete globals[PROMPT_CAPTURE_RELOAD_KEY];
