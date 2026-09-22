@@ -16,7 +16,17 @@ node diag/context-size.mjs --compare  # diff latest pro-* vs max-* JSON
 
 Raw JSON + MD per run save to `.test-output/context-size/` (gitignored).
 
-## Environment
+## Opus 5.5 addendum — 2026-09-22
+
+A targeted subscription-OAuth probe with Claude Agent SDK 0.3.280 verified:
+
+| requested id | status | served model | context | max output |
+|---|---|---|---|---|
+| `claude-opus-5-5` | success | `claude-opus-5-5` | 1M | 128K |
+
+The bare ID already serves 1M, so the bridge must not append `[1m]`. SDK 0.3.268 bundles Claude Code 2.1.268 and rejects this model locally with: `Claude Code 2.1.268 does not support this model; version 2.1.280 or newer is required.` The bridge therefore needs Agent SDK 0.3.280 or newer for Opus 5.5.
+
+## Original environment
 
 - Claude Agent SDK `@anthropic-ai/claude-agent-sdk` 0.2.141 (bundled Claude Code 2.1.141)
 - Auth: subscription OAuth (claude.ai), `ANTHROPIC_API_KEY` unset
@@ -107,8 +117,8 @@ zero model tokens).
 
 ## Findings
 
-1. **The `[1m]` suffix is the only reliable way to request 1M via the SDK.**
-   Bare model ids serve 200K (except the anomalous `opus-4-7`). The interactive
+1. **For the older models in the original matrix, the `[1m]` suffix is the only reliable way to request 1M via the SDK.**
+   Bare model ids serve 200K (except `opus-4-7`). Opus 5.5 is a newer exception: its bare ID serves 1M. The interactive
    Claude Code CLI auto-selects `[1m]` for Opus on Max/Team/Enterprise, but the
    SDK does not.
 2. **`opus-4-7` bare serves 1M everywhere** — stable across runs. Unexplained.

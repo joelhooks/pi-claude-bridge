@@ -3,22 +3,23 @@
 // Extracted from index.ts so tests can import without activating the extension.
 
 // pi-ai's bundled catalog is a release-time snapshot, so a model Anthropic
-// ships after it — Fable 5.1 on 28/08/2026 — is simply absent, and buildModels
-// drops what it cannot find. Rather than invent a context window that pi would
-// put behind its compaction threshold, inherit a verified sibling's metadata
-// and override only identity. Drop the entry when the base is missing too.
-export const DERIVED_FROM: Record<string, { from: string; name: string }> = {
+// ships after it is simply absent and buildModels drops what it cannot find.
+// Rather than invent model metadata that pi would use for its picker and
+// compaction threshold, inherit a verified sibling and override only identity.
+// Drop the entry when the base is missing too.
+export const DERIVED_FROM: Record<string, { from: string; name: string; maxTokens?: number }> = {
 	"claude-fable-5-1": { from: "claude-fable-5", name: "Claude Fable 5.1" },
+	"claude-opus-5-5": { from: "claude-opus-5", name: "Claude Opus 5.5", maxTokens: 128_000 },
 };
 
 function deriveMissing<T extends { id: string; [key: string]: any }>(piAiModels: T[], id: string): T | undefined {
 	const rule = DERIVED_FROM[id];
 	if (!rule) return undefined;
 	const base = piAiModels.find((m) => m.id === rule.from);
-	return base ? { ...base, id, name: rule.name } : undefined;
+	return base ? { ...base, ...rule, id, name: rule.name } : undefined;
 }
 
-export const MODEL_IDS_IN_ORDER = ["claude-fable-5-1", "claude-fable-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-5", "claude-sonnet-4-6", "claude-haiku-4-5"];
+export const MODEL_IDS_IN_ORDER = ["claude-fable-5-1", "claude-fable-5", "claude-opus-5-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-5", "claude-sonnet-4-6", "claude-haiku-4-5"];
 
 // Project pi-ai's model entries down to the fields pi's registerProvider expects,
 // and keep MODEL_IDS_IN_ORDER ordering. IDs missing from pi-ai are silently dropped.
@@ -56,6 +57,8 @@ const ONE_M_CONTEXT = 1_000_000;
 // not, and [1m] entitlement differs by model. See diag/CONTEXT-SIZE.md.
 export function resolveClaudeCodeRuntimeModel(modelId: string, settings: LongContextSettings): ClaudeCodeRuntimeModel {
 	switch (modelId) {
+		case "claude-opus-5-5":
+			return { cliModelId: "claude-opus-5-5", contextWindow: ONE_M_CONTEXT };
 		case "claude-opus-5":
 			return { cliModelId: "claude-opus-5[1m]", contextWindow: ONE_M_CONTEXT };
 		case "claude-opus-4-8":
