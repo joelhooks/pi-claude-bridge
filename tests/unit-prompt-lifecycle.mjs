@@ -50,6 +50,39 @@ describe("Pi 0.86 finalized prompt capture", () => {
 		assert.equal(__test.resolveProviderCapture(undefined), undefined);
 	});
 
+	it("resolves a wake whose prompt lacks sections an earlier extension added", () => {
+		// A project extension runs before the bridge and sets
+		// systemPromptOptions.sections in before_agent_start. The bridge records a base
+		// that already includes the section, but a wake skips before_agent_start and
+		// Pi sends the bare base. Seen live: 122020-char wake vs 122355-char capture.
+		const h = setup(); const opts = options(); const bare = buildSystemPrompt(opts);
+		opts.sections["rubicon-loop"] = "LOOP-NOTE";
+		const withSection = buildSystemPrompt(opts);
+		assert.ok(withSection.startsWith(bare) && withSection.length > bare.length, "section must trail the base");
+		h.get("before_agent_start")({ systemPrompt: withSection, systemPromptOptions: opts });
+		h.get("agent_start")({}, { getSystemPrompt: () => withSection });
+		h.get("agent_end")({});
+		const wake = () => projectPromptCapture(__test.resolveProviderCapture(bare), { skillReadTool: "mcp" });
+		for (const text of ["PROJECT-POLICY", "CLI-POLICY", "LOOP-NOTE"]) assert.ok(wake().includes(text));
+		assert.doesNotMatch(wake(), /operating inside pi/);
+		// The same holds after /reload carries the capture over.
+		h.get("session_shutdown")({ reason: "reload" });
+		h.get("session_start")({ reason: "reload" }, { ui: null, mode: "rpc" });
+		assert.match(wake(), /LOOP-NOTE/);
+		// Only whole trailing section blocks may be missing.
+		assert.throws(() => __test.resolveProviderCapture(bare.replace("PROJECT-POLICY", "CHANGED-POLICY")), /no capture/);
+		assert.throws(() => __test.resolveProviderCapture(bare.slice(0, -3)), /no capture/);
+		assert.throws(() => __test.resolveProviderCapture(`${bare}\n\n<other>\nX\n</other>`), /no capture/);
+	});
+
+	it("does not treat non-section trailing text as a missing section", () => {
+		const h = setup(); const opts = options(); const bare = buildSystemPrompt(opts);
+		const appended = `${bare}\n\nFREE-TEXT-POLICY`;
+		h.get("before_agent_start")({ systemPrompt: appended, systemPromptOptions: opts });
+		h.get("agent_start")({}, { getSystemPrompt: () => appended });
+		assert.throws(() => __test.resolveProviderCapture(bare), /no capture/);
+	});
+
 	it("projects the base when an earlier extension already forced a wrapped prompt", () => {
 		const h = setup(); const opts = options(); const base = buildSystemPrompt(opts);
 		opts.forceSystemPrompt = `${base}\n\nEARLY-EXTENSION-POLICY`;

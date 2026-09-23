@@ -932,10 +932,27 @@ const promptCaptures = new PromptCaptures(256, (diagnostic) => {
  *  where the real sessions are, and let diag/audit-warnings.mjs scan for it. */
 function resolveProviderCapture(systemPrompt?: string, promptParts?: readonly string[]) {
 	// A wake skips before_agent_start and Pi restores the base prompt. Only the
-	// exact base recorded for this session may reuse the finalized policy.
-	const key = wakePrompt && systemPrompt === wakePrompt.basePrompt
+	// recorded base for this session may reuse the finalized policy.
+	const key = wakePrompt && systemPrompt !== undefined && isWakeBase(systemPrompt, wakePrompt.basePrompt)
 		? wakePrompt.assembledPrompt : systemPrompt;
 	return promptCaptures.resolveOrDerive(key, promptParts);
+}
+
+/** One or more whole blocks exactly as Pi renders `systemPromptOptions.sections`. */
+const TRAILING_SECTIONS = /^(?:\n\n<([A-Za-z0-9_-]+)>\n[\s\S]*?\n<\/\1>)+$/;
+
+/**
+ * Whether a wake's prompt is the recorded base. Extensions that run before the
+ * bridge can add `systemPromptOptions.sections` in before_agent_start, so the
+ * base the bridge records already carries them, while a wake (which skips that
+ * hook) sends Pi's bare base without them. Accept exactly that difference: the
+ * recorded base is the wake prompt plus only whole trailing section blocks.
+ */
+function isWakeBase(prompt: string, recordedBase: string): boolean {
+	if (prompt === recordedBase) return true;
+	return prompt.length < recordedBase.length
+		&& recordedBase.startsWith(prompt)
+		&& TRAILING_SECTIONS.test(recordedBase.slice(prompt.length));
 }
 
 function reportLeaks(label: string): void {
