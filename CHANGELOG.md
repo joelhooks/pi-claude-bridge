@@ -2,6 +2,8 @@
 
 ## UNRELEASED
 
+- **Fix: guard reload wakes against stale resource policy** — capture typed prompt-section provenance and separately retain non-resource append instructions. Reload wakes can project changed addendum and project context without reviving old resource text; tools, rules, skills, and custom-section changes still fail closed. Rotate Claude history once when resource policy changes. Reject a wake whose transcript prompt is older than Pi's live prompt, and explain that a cold resumed session needs an ordinary user turn, not another reload. Verified on Pi 0.87.1 with real Opus 5.5 tools and the full extension rig.
+
 - **Add: Claude Opus 5.5** — `claude-opus-5-5` is selectable and the `opus` shortcut now resolves to it. Live Claude Code 2.1.280 and Agent SDK probes verified the bare model ID serves a 1M context window with 128K max output. The Agent SDK is bumped to 0.3.280 because its bundled Claude Code 2.1.268 rejects Opus 5.5 before making a request.
 - **Fix: Pi 0.86 provider transcript compatibility** — recover system instructions and tools with Pi's native transcript helpers, exclude system messages from Claude session cursors, and isolate one-off summaries. Capture finalized prompt changes, including prompts wrapped by extensions loaded before the bridge, and preserve chained instructions on reload wakes without reordering transcript sections. Early wrappers retain their policies without forwarding Pi-owned harness scaffolding into Claude Code. Retains the mid-turn compaction continuation fix. Requires Pi 0.86.0 or newer; development dependencies and contract tests now run on 0.86.0.
 

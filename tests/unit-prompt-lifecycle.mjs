@@ -40,7 +40,7 @@ describe("Pi 0.86 finalized prompt capture", () => {
 		assert.match(project(opts.forceSystemPrompt), /CHAINED-POLICY/);
 		h.get("session_shutdown")({ reason: "reload" });
 		h.get("session_start")({ reason: "reload" }, { ui: null, mode: "rpc" });
-		h.get("turn_start")({}, { getSystemPrompt: () => opts.forceSystemPrompt });
+		h.get("turn_start")({}, { getSystemPrompt: () => base });
 		const result = projectPromptCapture(__test.resolveProviderCapture(base), { skillReadTool: "mcp" });
 		assert.match(result, /PROJECT-POLICY/); assert.match(result, /CHAINED-POLICY/);
 		assert.doesNotMatch(result, /operating inside pi/);
@@ -94,6 +94,52 @@ describe("Pi 0.86 finalized prompt capture", () => {
 		assert.equal(opts.forceSystemPrompt, forced, "must not change the prompt seen by other extensions");
 		for (const text of ["PROJECT-POLICY", "CLI-POLICY", "EARLY-EXTENSION-POLICY"]) assert.ok(result.includes(text));
 		assert.doesNotMatch(result, /operating inside pi|Pi documentation/);
+	});
+
+	it("refreshes typed resource sections after reload without stale policy or lost wrapper instructions", () => {
+		const h = setup(); const opts = options(); const base = buildSystemPrompt(opts);
+		opts.promptGuidelines = ["CLI-POLICY"]; // Same bytes in a distinct source must survive removal of the append.
+		const native = buildSystemPrompt(opts);
+		h.get("before_agent_start")({ systemPrompt: native, systemPromptOptions: opts });
+		opts.forceSystemPrompt = `${native}\n\nWRAPPER-POLICY`;
+		h.get("agent_start")({}, { getSystemPrompt: () => opts.forceSystemPrompt });
+		h.get("context_with_system")({ messages: [{ role: "system", content: "", sections: buildSystemPromptSections(opts), timestamp: 0 }] });
+		h.get("session_shutdown")({ reason: "reload" });
+		h.get("session_start")({ reason: "reload" }, { ui: null, mode: "rpc" });
+		const fresh = { ...opts, forceSystemPrompt: undefined, appendSystemPrompt: "NEW-APPEND", contextFiles: [{ path: "/fixture/AGENTS.md", content: "NEW-PROJECT-POLICY" }] };
+		const sections = buildSystemPromptSections(fresh);
+		const resolved = __test.resolveProviderCapture(buildSystemPrompt(fresh), Object.values(sections), sections);
+		const result = projectPromptCapture(resolved, { skillReadTool: "mcp" });
+		for (const text of ["NEW-APPEND", "NEW-PROJECT-POLICY", "WRAPPER-POLICY", "CLI-POLICY"]) assert.ok(result.includes(text));
+		assert.doesNotMatch(result, /operating inside pi|Pi documentation/);
+		assert.ok(!result.includes("\nPROJECT-POLICY\n"));
+		assert.equal(project(native).includes("NEW-APPEND"), false, "historical capture must not be mutated");
+		for (const name of ["rules", "tools", "preamble", "skills", "custom-policy"]) {
+			const changed = { ...sections, [name]: "UNVERIFIED" };
+			assert.throws(() => __test.resolveProviderCapture(Object.values(changed).join("\n\n"), Object.values(changed), changed), /no capture/);
+		}
+	});
+
+	it("blocks a stale first wake instead of sending policy that reload replaced", () => {
+		const h = setup(); const opts = options(); const base = buildSystemPrompt(opts);
+		h.get("before_agent_start")({ systemPrompt: base, systemPromptOptions: opts });
+		h.get("agent_start")({}, { getSystemPrompt: () => base });
+		h.get("agent_end")({});
+		const current = buildSystemPrompt({ ...opts, appendSystemPrompt: "CURRENT-POLICY" });
+		h.get("agent_start")({}, { getSystemPrompt: () => current });
+		assert.throws(() => __test.resolveProviderCapture(base), /older prompt than Pi's current resource state/);
+	});
+
+	it("cannot refresh unknown or policy-overridden resource sections", () => {
+		const h = setup(); const opts = options();
+		opts.sections.addendum = "EXPLICIT-OVERRIDE";
+		const base = buildSystemPrompt(opts); const sections = buildSystemPromptSections(opts);
+		h.get("before_agent_start")({ systemPrompt: base, systemPromptOptions: opts });
+		h.get("context_with_system")({ messages: [{ role: "system", content: "", sections, timestamp: 0 }] });
+		const changed = { ...sections, addendum: "CHANGED" };
+		assert.throws(() => __test.resolveProviderCapture(Object.values(changed).join("\n\n"), Object.values(changed), changed), /no capture/);
+		h.get("session_start")({ reason: "resume" }, { ui: null, mode: "rpc" });
+		assert.throws(() => __test.resolveProviderCapture(base, Object.values(sections), sections), /ordinary user message/);
 	});
 
 	it("preserves a standalone full replacement instead of resurrecting old policy", () => {

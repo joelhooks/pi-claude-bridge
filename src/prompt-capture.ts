@@ -8,6 +8,11 @@ import { renderSkillsBlock, type SkillReadTool } from "./skills.js";
 export type PromptCaptureInput = {
 	custom?: string;
 	append?: string;
+	/** Captured separately from appendSystemPrompt; never recover this by string subtraction. */
+	resourceAppendRemainder?: string;
+	resourceSections?: Record<string, string>;
+	/** Current typed project_context section on a resource-only refresh. */
+	projectContext?: string;
 	/** Possible ends of Pi's base prompt before before_agent_start appends. */
 	baseSystemPromptLengths?: readonly number[];
 	contextFiles: { path: string; content: string }[];
@@ -117,6 +122,9 @@ export class PromptCaptures {
 			assembledPrompt: capture.assembledPrompt,
 			custom: capture.custom,
 			append: capture.append,
+			resourceAppendRemainder: capture.resourceAppendRemainder,
+			resourceSections: capture.resourceSections ? { ...capture.resourceSections } : undefined,
+			projectContext: capture.projectContext,
 			baseSystemPromptLengths: capture.baseSystemPromptLengths === undefined
 				? undefined
 				: [...capture.baseSystemPromptLengths],
@@ -143,6 +151,9 @@ export class PromptCaptures {
 
 		capture.custom = input.custom;
 		capture.append = input.append;
+		capture.resourceAppendRemainder = input.resourceAppendRemainder;
+		capture.resourceSections = input.resourceSections ? { ...input.resourceSections } : undefined;
+		capture.projectContext = input.projectContext;
 		capture.baseSystemPromptLengths = input.baseSystemPromptLengths === undefined
 			? undefined
 			: [...input.baseSystemPromptLengths];
@@ -259,9 +270,12 @@ export class PromptCaptures {
 				`prompt-capture: no capture for this ${systemPrompt.length}-char system prompt, and it embeds none of the ${this.captures.size} known. `
 				+ `Closest known match diverges at offset ${matches[0]?.firstDivergent ?? "?"} (${matches.length ? matches[0].key.length : 0}-char key). `
 				+ `Claude Code would receive none of this turn's context files, skills or custom instructions. `
-				+ `The usual cause is an extension loaded after claude-bridge that rewrites the system prompt from before_agent_start — `
-				+ `one that wraps it is fine, one that rebuilds or strips it leaves nothing to match. `
-				+ `(Also possible: pi rebuilt the prompt outside before_agent_start — a late-registered tool or fresh resource discovery.)`,
+				+ (this.captures.size === 0
+					? `This process has no prompt capture. A resumed session's timer/intercom wake skips before_agent_start. `
+					: `The current prompt differs from the captured instructions, possibly after resource reload or tool changes. `)
+				+ `Send an ordinary user message to refresh the capture before retrying a timer/intercom wake. `
+				+ `Reload or process restart alone does not initialize a cold resumed session. `
+				+ `No instructions were dropped or guessed.`,
 			);
 		}
 
@@ -269,6 +283,45 @@ export class PromptCaptures {
 		// projectCustom substitutes the embedded captures in place and preserves every
 		// byte between and around them.
 		return { assembledPrompt: systemPrompt, custom: systemPrompt, contextFiles: [], skills: [], inherited: embedded };
+	}
+
+	/** Attach Pi's typed section state only to an exact, provenance-bearing base. */
+	recordResourceSections(systemPrompt: string, sections: Record<string, string>): void {
+		const base = this.captures.get(systemPrompt);
+		if (base?.resourceAppendRemainder !== undefined && Object.values(sections).join("\n\n") === systemPrompt) {
+			base.resourceSections = { ...sections };
+		}
+	}
+
+	/** Only resource-file changes are allowed here. Tools, rules, custom sections,
+	 * preamble and skills must still match byte-for-byte. Never parse rendered XML
+	 * for ownership, weaken prefixes, or reuse old resource text as new policy. */
+	resolveResourceUpdate(systemPrompt: string, sections: Record<string, string>, wrapperKey?: string): PromptCapture | undefined {
+		if (Object.values(sections).join("\n\n") !== systemPrompt) return undefined;
+		const wrapper = wrapperKey ? this.captures.get(wrapperKey) : undefined;
+		const candidates = this.reachableCaptures().filter((node) => {
+			if (!node.resourceSections || node.resourceAppendRemainder === undefined || node.inherited.length > 0) return false;
+			const names = new Set([...Object.keys(node.resourceSections), ...Object.keys(sections)]);
+			return [...names].every((name) => name === "addendum" || name === "project_context"
+				|| node.resourceSections![name] === sections[name]);
+		});
+		const base = this.newestCapture(candidates);
+		if (!base) return undefined;
+		const fresh: PromptCapture = {
+			...base, assembledPrompt: systemPrompt, contextFiles: [],
+			projectContext: sections.project_context,
+			append: [sections.addendum, base.resourceAppendRemainder].filter(Boolean).join("\n\n") || undefined,
+			resourceSections: { ...sections },
+		};
+		if (!wrapperKey || wrapper === base) return fresh;
+		if (!wrapper) return undefined;
+		let replaced = false;
+		const rebase = (node: PromptCapture): PromptCapture => {
+			if (node === base) { replaced = true; return fresh; }
+			return { ...node, inherited: node.inherited.map((edge) => ({ ...edge, parent: rebase(edge.parent) })) };
+		};
+		const result = rebase(wrapper);
+		return replaced ? result : undefined;
 	}
 
 	get size(): number {
@@ -345,7 +398,7 @@ export class PromptCaptures {
 }
 
 /** Only complete, non-empty parts separated by Pi's exact separator may move. */
-function isExactPartPermutation(prompt: string, parts: readonly string[]): boolean {
+export function isExactPartPermutation(prompt: string, parts: readonly string[]): boolean {
 	const remaining = [...parts].sort((a, b) => b.length - a.length);
 	let rest = prompt;
 	while (remaining.length > 0) {
@@ -422,7 +475,7 @@ function projectCapture(
 				? capture.assembledPrompt.slice(baseEnd)
 				: undefined;
 		const parts = [
-			formatProjectContext(capture.contextFiles),
+			capture.projectContext ?? formatProjectContext(capture.contextFiles),
 			renderSkillsBlock(ownSkills, options.skillReadTool),
 			custom,
 			capture.append,

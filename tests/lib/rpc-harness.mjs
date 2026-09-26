@@ -52,7 +52,7 @@ try {
  * @param {number} opts.defaultTimeout - Default timeout for send/wait operations (default: 30000)
  */
 export function createRpcHarness(opts) {
-	const { name, args = [], env = {}, cwd = DIR, defaultTimeout = 30_000 } = opts;
+	const { name, args = [], env = {}, cwd = DIR, defaultTimeout = 30_000, ambientExtensions = false } = opts;
 
 	const LOGDIR = `${DIR}/.test-output`;
 	mkdirSync(LOGDIR, { recursive: true });
@@ -76,7 +76,7 @@ export function createRpcHarness(opts) {
 		writeFileSync(DEBUG_LOG, "");
 		stopped = false;
 		rpcLog = createWriteStream(RPC_LOG, { flags: "a" });
-		const spawnArgs = ["--no-session", "-ne", "-e", DIR, "--mode", "rpc", ...args];
+		const spawnArgs = ["--no-session", ...(ambientExtensions ? [] : ["-ne"]), "-e", DIR, "--mode", "rpc", ...args];
 		pi = spawn("pi", spawnArgs, {
 			cwd,
 			stdio: ["pipe", "pipe", "pipe"],

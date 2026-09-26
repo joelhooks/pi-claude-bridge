@@ -12,7 +12,7 @@ export default function (pi: ExtensionAPI) {
 		description: "Trigger a canary turn without before_agent_start",
 		handler: async () => pi.sendMessage({
 			customType: "bridge-canary",
-			content: "Read marker.txt again using the read tool. Reply with its contents and the required policy suffix.",
+			content: "Read marker.txt again using the read tool. Return only its contents, the markers required by the current system instructions, and the required policy suffix. No explanation or discussion of earlier responses.",
 			display: true,
 		}, { triggerTurn: true }),
 	});

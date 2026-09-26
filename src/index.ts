@@ -21,6 +21,7 @@ import { claudeCodeSettings, loadConfig, markStartupNoticeShown, type Config } f
 import {
 	collectPromptSkills,
 	findBaseSystemPromptLengths,
+	isExactPartPermutation,
 	projectPromptCapture,
 	PromptCaptures,
 	type PromptCaptureSnapshot,
@@ -901,6 +902,8 @@ function showStartupNoticeOnce(): void {
 const PROMPT_CAPTURE_RELOAD_KEY = Symbol.for("@joelhooks/pi-claude-bridge/prompt-capture-reload-v1");
 type WakePrompt = { basePrompt: string; assembledPrompt: string };
 let wakePrompt: WakePrompt | undefined;
+let lastResourceRefreshPrompt: string | undefined;
+let expectedWakePrompt: string | undefined;
 type PromptCaptureReloadCarrier = { version: 1; captures: PromptCaptureSnapshot[]; wakePrompt?: WakePrompt };
 const promptCaptureReloadGlobals = () => globalThis as typeof globalThis & Record<symbol, unknown>;
 const isPromptCaptureReloadCarrier = (value: unknown): value is PromptCaptureReloadCarrier =>
@@ -930,12 +933,34 @@ const promptCaptures = new PromptCaptures(256, (diagnostic) => {
  *  ack. The activeQueryContexts leak was present on every single happy-path run and
  *  no test noticed, because nothing asserted that anything ends clean — so assert it
  *  where the real sessions are, and let diag/audit-warnings.mjs scan for it. */
-function resolveProviderCapture(systemPrompt?: string, promptParts?: readonly string[]) {
+function resolveProviderCapture(systemPrompt?: string, promptParts?: readonly string[], resourceSections?: Record<string, string>) {
+	if (expectedWakePrompt !== undefined && systemPrompt !== expectedWakePrompt
+		&& !(promptParts?.length && promptParts.join("\n\n") === systemPrompt && isExactPartPermutation(expectedWakePrompt, promptParts))) {
+		throw new Error("prompt-capture: this wake carries an older prompt than Pi's current resource state. "
+			+ "Send an ordinary user message to refresh the capture before retrying the timer/intercom wake. "
+			+ "No request was sent with stale instructions; reload or restart alone is not a capture refresh.");
+	}
 	// A wake skips before_agent_start and Pi restores the base prompt. Only the
 	// recorded base for this session may reuse the finalized policy.
 	const key = wakePrompt && systemPrompt !== undefined && isWakeBase(systemPrompt, wakePrompt.basePrompt)
 		? wakePrompt.assembledPrompt : systemPrompt;
-	return promptCaptures.resolveOrDerive(key, promptParts);
+	try {
+		return promptCaptures.resolveOrDerive(key, promptParts);
+	} catch (error) {
+		if (systemPrompt && resourceSections) {
+			const refreshed = promptCaptures.resolveResourceUpdate(systemPrompt, resourceSections, wakePrompt?.assembledPrompt);
+			if (refreshed) {
+				// Do not resume a Claude session that retains the old resource policy.
+				// Rotate once for this refreshed prompt, not on every recurring wake.
+				if (lastResourceRefreshPrompt !== systemPrompt && sharedSession) {
+					sharedSession = { ...sharedSession, needsRebuild: true };
+				}
+				lastResourceRefreshPrompt = systemPrompt;
+				return refreshed;
+			}
+		}
+		throw error;
+	}
 }
 
 /** One or more whole blocks exactly as Pi renders `systemPromptOptions.sections`. */
@@ -1562,6 +1587,10 @@ function drainForAbort(c: QueryContext, promptStream: PromptStream): void {
 function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
 	showStartupNoticeOnce();
 	const promptParts = transcriptPromptParts(context);
+	const systemState = piAi.getCurrentSystemMessage(context.messages);
+	const resourceSections = systemState?.sections && !piAi.contentText(systemState.content)
+		? Object.fromEntries(Object.entries(systemState.sections).filter((entry): entry is [string, string] => typeof entry[1] === "string"))
+		: undefined;
 	context = toBridgeContext(context);
 	// Pi's one-off summarizers (including /bug) deliberately disable caching
 	// and carry one user request without tools. Never send them into the live
@@ -1649,7 +1678,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// `--no-skills` reach Claude Code by leaving nothing to forward. A sub-agent's
 	// custom override embeds its parent's assembled Pi prompt; recursive projection
 	// replaces that exact inherited prompt with its already-safe portable parts.
-	const promptCapture = resolveProviderCapture(context.systemPrompt, promptParts);
+	const promptCapture = resolveProviderCapture(context.systemPrompt, promptParts, resourceSections);
 	const systemPromptAppend = promptCapture
 		? projectPromptCapture(promptCapture, {
 			skillReadTool: mcpTools.some((tool) => tool.name === "read") ? "mcp" : "none",
@@ -2221,6 +2250,8 @@ export default function (pi: ExtensionAPI) {
 		lastSystemPromptOptions = undefined;
 		basePromptBeforeHandlers = undefined;
 		wakePrompt = undefined;
+		lastResourceRefreshPrompt = undefined;
+		expectedWakePrompt = undefined;
 		midTurnContinuation = null;
 
 		// Clear the global streamSimple if this instance registered it.
@@ -2265,8 +2296,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		const selectedTools = pi.getActiveTools?.() ?? options.selectedTools;
 		const hasRead = !selectedTools || selectedTools.includes("read");
-		const additions = [
-			options.appendSystemPrompt,
+		const remainder = [
 			...(options.promptGuidelines ?? []),
 			...(selectedTools ?? []).flatMap((name) => options.toolGuidelines?.[name] ?? []),
 			...Object.entries(options.sections ?? {}).filter(([, text]) => text)
@@ -2274,13 +2304,17 @@ export default function (pi: ExtensionAPI) {
 		].filter(Boolean).join("\n\n");
 		promptCaptures.record(systemPrompt, {
 			custom: options.customPrompt,
-			append: additions || undefined,
+			append: [options.appendSystemPrompt, remainder].filter(Boolean).join("\n\n") || undefined,
+			// An explicit override of these names is not a resource-loader refresh.
+			resourceAppendRemainder: Object.keys(options.sections ?? {}).some((name) => name === "addendum" || name === "project_context")
+				? undefined : remainder,
 			baseSystemPromptLengths: findBaseSystemPromptLengths(systemPrompt, options.cwd),
 			contextFiles: options.contextFiles ?? [],
 			skills: hasRead ? options.skills ?? [] : [],
 		});
 	}
 	pi.on("before_agent_start", (event) => {
+		expectedWakePrompt = undefined;
 		lastSystemPromptOptions = event.systemPromptOptions;
 		basePromptBeforeHandlers = event.systemPrompt;
 		wakePrompt = undefined;
@@ -2306,6 +2340,7 @@ export default function (pi: ExtensionAPI) {
 	// Capture the finalized prompt before every request. On a post-reload wake
 	// there are no fresh options: retain the restored graph instead of wiping it.
 	const captureCurrentPrompt = (_event: unknown, ctx: ExtensionContext) => {
+		if (!lastSystemPromptOptions) expectedWakePrompt = ctx.getSystemPrompt();
 		if (lastSystemPromptOptions) {
 			const assembledPrompt = ctx.getSystemPrompt();
 			recordSystemPrompt(assembledPrompt, lastSystemPromptOptions);
@@ -2314,6 +2349,15 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 	};
+	// Observe Pi's typed state before its forced-prompt projection. This records
+	// section ownership without interpreting XML inside user-supplied text.
+	pi.on("context_with_system", (event) => {
+		const state = piAi.getCurrentSystemMessage(event.messages);
+		if (!state?.sections || piAi.contentText(state.content)) return;
+		const sections = Object.fromEntries(Object.entries(state.sections)
+			.filter((entry): entry is [string, string] => typeof entry[1] === "string"));
+		promptCaptures.recordResourceSections(piAi.getCurrentSystemPrompt(event.messages), sections);
+	});
 	pi.on("agent_start", captureCurrentPrompt);
 	pi.on("turn_start", captureCurrentPrompt);
 	pi.on("agent_end", () => { lastSystemPromptOptions = undefined; });
