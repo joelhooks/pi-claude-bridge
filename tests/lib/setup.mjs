@@ -17,4 +17,6 @@ import { join } from "node:path";
 
 const logDir = mkdtempSync(join(tmpdir(), "claude-bridge-test-log-"));
 process.env.CLAUDE_BRIDGE_DEBUG_PATH = join(logDir, "claude-bridge.log");
+// Same hazard for persisted prompt captures: never write fixtures into ~/.pi.
+process.env.CLAUDE_BRIDGE_CAPTURE_DIR = join(logDir, "prompt-captures");
 process.on("exit", () => rmSync(logDir, { recursive: true, force: true }));

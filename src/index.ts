@@ -24,8 +24,15 @@ import {
 	isExactPartPermutation,
 	projectPromptCapture,
 	PromptCaptures,
-	type PromptCaptureSnapshot,
 } from "./prompt-capture.js";
+import {
+	isPromptCaptureCarrier,
+	loadPromptCaptures,
+	prunePromptCaptures,
+	savePromptCaptures,
+	type PromptCaptureCarrier,
+	type WakePrompt,
+} from "./prompt-capture-store.js";
 import { collectCarriedAttachments, placeCarriedAttachments, type CarriedAttachment } from "./attachments.js";
 import { createToolServer } from "./mcp-server.js";
 import { buildActionSummary, type ToolCallState } from "./askclaude-ui.js";
@@ -900,17 +907,25 @@ function showStartupNoticeOnce(): void {
 // Captures of what pi assembled per agent; see src/prompt-capture.ts for why this
 // is keyed rather than held in a single slot.
 const PROMPT_CAPTURE_RELOAD_KEY = Symbol.for("@joelhooks/pi-claude-bridge/prompt-capture-reload-v1");
-type WakePrompt = { basePrompt: string; assembledPrompt: string };
 let wakePrompt: WakePrompt | undefined;
 let lastResourceRefreshPrompt: string | undefined;
 let expectedWakePrompt: string | undefined;
-type PromptCaptureReloadCarrier = { version: 1; captures: PromptCaptureSnapshot[]; wakePrompt?: WakePrompt };
+/** Pi session whose captures are persisted; see src/prompt-capture-store.ts. */
+let captureSessionId: string | undefined;
 const promptCaptureReloadGlobals = () => globalThis as typeof globalThis & Record<symbol, unknown>;
-const isPromptCaptureReloadCarrier = (value: unknown): value is PromptCaptureReloadCarrier =>
-	typeof value === "object"
-	&& value !== null
-	&& (value as { version?: unknown }).version === 1
-	&& Array.isArray((value as { captures?: unknown }).captures);
+const promptCaptureCarrier = (): PromptCaptureCarrier => ({ version: 1, captures: promptCaptures.snapshot(), wakePrompt });
+
+/** Persist after every settled turn so a restarted process can serve the next wake.
+ *  A failed write costs only that recovery path, never the turn. */
+function persistPromptCaptures(label: string): void {
+	try {
+		if (savePromptCaptures(captureSessionId, promptCaptureCarrier())) {
+			debug(`${label}: persisted ${promptCaptures.size} prompt captures for ${captureSessionId?.slice(0, 8)}`);
+		}
+	} catch (error) {
+		debug(`${label}: failed to persist prompt captures`, error);
+	}
+}
 
 const promptCaptures = new PromptCaptures(256, (diagnostic) => {
 	const first = diagnostic.matches[0];
@@ -2266,11 +2281,12 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", (event, ctx) => {
 		piUI = ctx.ui;
 		piMode = ctx.mode;
+		captureSessionId = ctx?.sessionManager?.getSessionId?.();
 		const globals = promptCaptureReloadGlobals();
 		if (event.reason === "reload") {
 			const carrier = globals[PROMPT_CAPTURE_RELOAD_KEY];
 			delete globals[PROMPT_CAPTURE_RELOAD_KEY];
-			if (isPromptCaptureReloadCarrier(carrier)) {
+			if (isPromptCaptureCarrier(carrier)) {
 				promptCaptures.restore(carrier.captures);
 				wakePrompt = carrier.wakePrompt;
 				debug(`session_start:reload: restored ${carrier.captures.length} prompt captures`);
@@ -2279,6 +2295,24 @@ export default function (pi: ExtensionAPI) {
 			delete globals[PROMPT_CAPTURE_RELOAD_KEY];
 			if (event.reason === "new" || event.reason === "resume" || event.reason === "fork") {
 				clearSession(`session_start:${event.reason}`);
+			}
+			// A process that starts on an existing session (startup with --continue,
+			// or /resume) restores that session's captures from disk, so its first
+			// timer/intercom wake resolves exactly as it would have before the restart.
+			// Any resource drift since then still goes through resolveResourceUpdate;
+			// anything else still fails closed.
+			if (event.reason === "startup" || event.reason === "resume") {
+				try {
+					const carrier = loadPromptCaptures(captureSessionId);
+					if (carrier) {
+						promptCaptures.restore(carrier.captures);
+						wakePrompt = carrier.wakePrompt;
+						debug(`session_start:${event.reason}: restored ${carrier.captures.length} persisted prompt captures`);
+					}
+				} catch (error) {
+					debug(`session_start:${event.reason}: unreadable persisted prompt captures`, error);
+				}
+				if (event.reason === "startup") prunePromptCaptures();
 			}
 		}
 	});
@@ -2360,15 +2394,15 @@ export default function (pi: ExtensionAPI) {
 	});
 	pi.on("agent_start", captureCurrentPrompt);
 	pi.on("turn_start", captureCurrentPrompt);
-	pi.on("agent_end", () => { lastSystemPromptOptions = undefined; });
+	pi.on("agent_end", () => {
+		lastSystemPromptOptions = undefined;
+		persistPromptCaptures("agent_end");
+	});
 	pi.on("session_shutdown", (event) => {
 		const globals = promptCaptureReloadGlobals();
+		persistPromptCaptures(`session_shutdown:${event.reason}`);
 		if (event.reason === "reload") {
-			globals[PROMPT_CAPTURE_RELOAD_KEY] = {
-				version: 1,
-				captures: promptCaptures.snapshot(),
-				wakePrompt,
-			} satisfies PromptCaptureReloadCarrier;
+			globals[PROMPT_CAPTURE_RELOAD_KEY] = promptCaptureCarrier();
 		} else {
 			delete globals[PROMPT_CAPTURE_RELOAD_KEY];
 		}
