@@ -222,6 +222,17 @@ test("result.modelUsage reports the served context window", { timeout: 120_000 }
 		`modelUsage entries missing contextWindow: ${JSON.stringify(result.modelUsage)}`);
 });
 
+test("Sonnet 5.5 [1m] actually serves the bridge's registered window", { timeout: 120_000 }, async () => {
+	const { result } = await collect(query({
+		prompt: "Reply with just: OK",
+		options: providerOptions({ model: "claude-sonnet-5-5[1m]", maxTurns: 1, persistSession: false }),
+	}));
+	assert.equal(result?.subtype, "success");
+	const usage = result.modelUsage?.["claude-sonnet-5-5[1m]"];
+	assert.ok(usage, "Claude Code did not use the requested Sonnet 5.5 [1m] model");
+	assert.equal(usage.contextWindow, 1_000_000, "Pi's registered context must match the served window");
+});
+
 // --- Streaming ---
 
 test("includePartialMessages yields the stream_event shapes processStreamEvent destructures", { timeout: 120_000 }, async () => {
