@@ -1771,17 +1771,24 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	queryCtx.promptStream = promptStream;
 	const mcpServers = buildMcpServers(mcpTools, queryCtx);
 	// Claude Code's interrupted-turn resume fires its API request as soon as
-	// startup settles, without waiting for SDK MCP servers to answer tools/list;
-	// an answer that lands even ~100ms late leaves the resumed turn with no
-	// tools, and the model ends it having only thought about the call it meant to
-	// make. Our server answers from pi's event loop, which is busy right after a
-	// compaction, so this was lost about a third of the time. CC does run
+	// startup settles, without waiting for SDK MCP servers to connect; tools that
+	// are not in by then are absent from the resumed turn, and the model ends it
+	// having only described the call it meant to make. CC does run
 	// UserPromptSubmit hooks for the resume prompt and blocks on them, so the hook
-	// holds the request until the listing has been served. Pinned in
-	// tests/int-cc-contracts.mjs; the cap only guards against a listing that
-	// never comes, in which case the turn proceeds as it would have anyway.
-	const continuationHooks = resumeInterruptedTurn && mcpServers
-		? { UserPromptSubmit: [{ hooks: [makeToolListingGate(mcpServers[MCP_SERVER_NAME].listed)] }] }
+	// holds the request until CC itself reports our server connected. Our
+	// tools/list handler running is not enough: CC still has to take the answer
+	// in, and with a real session's ~40k tokens of tools the hook's reply
+	// overtook it in about half of the overflow recoveries tested. A pushed prompt already waits for
+	// the connection (both pinned in tests/int-tool-listing-gate.mjs), but every
+	// fresh query is gated anyway: it costs one status round trip, and it keeps
+	// the guarantee if CC stops waiting. The cap only guards against a server
+	// that never connects, in which case the turn proceeds as it would have anyway.
+	let gatedQuery: ReturnType<typeof query> | undefined;
+	const toolListingHooks = mcpServers
+		? { UserPromptSubmit: [{ hooks: [makeToolListingGate(mcpServers[MCP_SERVER_NAME].listed, async () => {
+			const statuses = gatedQuery ? await gatedQuery.mcpServerStatus() : [];
+			return statuses.some((s) => s.name === MCP_SERVER_NAME && s.status === "connected");
+		})] }] }
 		: undefined;
 
 	// MCP auto-loading suppression: CC reads MCP servers from ~/.claude.json (top-level
@@ -1844,7 +1851,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		extraArgs,
 		...(effort ? { effort } : {}),
 		...(mcpServers ? { mcpServers } : {}),
-		...(continuationHooks ? { hooks: continuationHooks } : {}),
+		...(toolListingHooks ? { hooks: toolListingHooks } : {}),
 		...(resumeSessionId ? { resume: resumeSessionId } : {}),
 		...(claudeExecutable ? { pathToClaudeCodeExecutable: claudeExecutable } : {}),
 		...makeCliDebugOptions("provider"),
@@ -1860,6 +1867,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// 3. Start SDK query and claim it for this context
 	let wasAborted = false;
 	const sdkQuery = query({ prompt: promptStream.stream, options: queryOptions });
+	gatedQuery = sdkQuery;
 	queryCtx.activeQuery = sdkQuery;
 	activeQueryContexts.add(queryCtx);
 
@@ -1979,24 +1987,53 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 }
 
 const TOOL_LISTING_GATE_CAP_MS = 10_000;
+const TOOL_LISTING_GATE_POLL_MS = 25;
 
-/** A UserPromptSubmit hook that lets the prompt through once `listed` has
- *  resolved, or after the cap. Fires for every prompt of the query, so later
- *  steers pass straight through. */
-function makeToolListingGate(listed: Promise<void>): HookCallback {
+/** A UserPromptSubmit hook that lets the query's first prompt through once
+ *  Claude Code has asked for the tool list (`listed`) and then reports the
+ *  server connected (`isConnected`), or after the cap. The hook fires for every
+ *  prompt of the query; once open, later steers pass straight through. */
+function makeToolListingGate(listed: Promise<void>, isConnected: () => Promise<boolean>): HookCallback {
+	let open = false;
 	return async () => {
+		if (open) return { continue: true };
 		const started = Date.now();
-		let timer: ReturnType<typeof setTimeout> | undefined;
-		const capped = await Promise.race([
-			listed.then(() => false),
-			new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(true), TOOL_LISTING_GATE_CAP_MS); }),
-		]);
-		clearTimeout(timer);
+		const outcome = await waitForToolListing(listed, isConnected, started + TOOL_LISTING_GATE_CAP_MS);
+		open = true;
 		const waited = Date.now() - started;
-		if (capped) debug(`WARNING: continuation prompt released after ${waited}ms without a tools/list from Claude Code — the resumed turn may run without tools`);
-		else debug(`provider: continuation prompt gate: tools/list ${waited > 0 ? `served after ${waited}ms` : "already served"}, releasing prompt`);
+		if (outcome.kind === "connected") {
+			debug(`provider: tool-listing gate: tools/list served after ${outcome.listedAfter}ms, ${MCP_SERVER_NAME} connected after ${waited}ms, releasing prompt`);
+		} else {
+			debug(`WARNING: tool-listing gate released after ${waited}ms before Claude Code reported ${MCP_SERVER_NAME} connected (${outcome.reason}) — the turn may run without tools`);
+		}
 		return { continue: true };
 	};
+}
+
+type ToolListingOutcome =
+	| { kind: "connected"; listedAfter: number }
+	| { kind: "released"; reason: string };
+
+async function waitForToolListing(listed: Promise<void>, isConnected: () => Promise<boolean>, deadline: number): Promise<ToolListingOutcome> {
+	const started = Date.now();
+	const beforeDeadline = <T>(work: Promise<T>): Promise<T | "capped"> => {
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const cap = new Promise<"capped">((resolve) => { timer = setTimeout(() => resolve("capped"), Math.max(0, deadline - Date.now())); });
+		return Promise.race([work, cap]).finally(() => clearTimeout(timer));
+	};
+	if (await beforeDeadline(listed) === "capped") return { kind: "released", reason: "no tools/list" };
+	const listedAfter = Date.now() - started;
+	while (true) {
+		let status: boolean | "capped";
+		try {
+			status = await beforeDeadline(isConnected());
+		} catch (error) {
+			return { kind: "released", reason: `status failed: ${error instanceof Error ? error.message : String(error)}` };
+		}
+		if (status === true) return { kind: "connected", listedAfter };
+		if (status === "capped" || Date.now() >= deadline) return { kind: "released", reason: "not connected by the cap" };
+		await beforeDeadline(new Promise((resolve) => setTimeout(resolve, TOOL_LISTING_GATE_POLL_MS)));
+	}
 }
 
 /** Whether pi's history ends on tool results whose assistant message the rebuild

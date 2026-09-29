@@ -63,8 +63,9 @@ export function createToolServer(name: string, tools: McpToolDef[]) {
 
 	// Resolves the first time Claude Code asks for the tool list. Until then the
 	// query's tool pool does not contain these tools, and a request built before
-	// that point goes to the model without them. See the continuation path in
-	// index.ts for the one place that has to wait on it.
+	// that point goes to the model without them. It is necessary, not sufficient:
+	// CC still has to take the answer in, so the tool-listing gate in index.ts
+	// waits on this and then on CC reporting the server connected.
 	let markListed: () => void = () => {};
 	const listed = new Promise<void>((resolve) => { markListed = resolve; });
 
