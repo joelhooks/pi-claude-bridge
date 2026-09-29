@@ -120,7 +120,7 @@ try {
 	const syncLines = debugLog.slice(teardownAt).match(/syncResult: path=\S+/g) ?? [];
 	assert(syncLines[0] === undefined || /path=rebuild/.test(syncLines[0]), `first sync after teardown was not a rebuild: ${syncLines[0]}`);
 	assert(!/WARNING: mid-turn continuation/.test(debugLog), "continuation fell back to a text prompt");
-	assert(!/WARNING: continuation prompt released/.test(debugLog), "tools/list gate hit its cap on the continuation query");
+	assert(!/WARNING: tool-listing gate released/.test(debugLog), "tool-listing gate released before Claude Code reported the tools connected");
 	assert(!/currentPiStream overwritten/.test(debugLog), "debug log reported currentPiStream overwrite");
 	assert(!/left state behind/.test(debugLog), "a query leaked state");
 
