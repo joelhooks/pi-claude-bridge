@@ -74,6 +74,7 @@ describe("MODELS projection", () => {
 
 describe("Claude Code runtime model policy", () => {
 	it("uses measured Pro defaults", () => {
+		assert.deepEqual(resolveClaudeCodeRuntimeModel("claude-sonnet-5-5", PRO), { cliModelId: "claude-sonnet-5-5[1m]", contextWindow: 1000000 });
 		assert.deepEqual(resolveClaudeCodeRuntimeModel("claude-opus-5-5", PRO), { cliModelId: "claude-opus-5-5", contextWindow: 1000000 });
 		assert.deepEqual(resolveClaudeCodeRuntimeModel("claude-opus-5", PRO), { cliModelId: "claude-opus-5[1m]", contextWindow: 1000000 });
 		assert.deepEqual(resolveClaudeCodeRuntimeModel("claude-opus-4-8", PRO), { cliModelId: "claude-opus-4-8[1m]", contextWindow: 1000000 });
@@ -107,6 +108,7 @@ describe("claudeCodeModelId", () => {
 	const models = buildModels(MODEL_IDS_IN_ORDER.map(oneM));
 
 	it("returns the measured SDK request id", () => {
+		assert.equal(claudeCodeModelId(find(models, "claude-sonnet-5-5"), PRO), "claude-sonnet-5-5[1m]");
 		assert.equal(claudeCodeModelId(find(models, "claude-opus-5-5"), PRO), "claude-opus-5-5");
 		assert.equal(claudeCodeModelId(find(models, "claude-opus-5"), PRO), "claude-opus-5[1m]");
 		assert.equal(claudeCodeModelId(find(models, "claude-opus-4-8"), PRO), "claude-opus-4-8[1m]");
@@ -124,6 +126,7 @@ describe("applyLongContext", () => {
 
 	it("registers measured Pro defaults", () => {
 		const registered = applyLongContext(models, PRO);
+		assert.equal(find(registered, "claude-sonnet-5-5").contextWindow, 1000000);
 		assert.equal(find(registered, "claude-opus-5-5").contextWindow, 1000000);
 		assert.equal(find(registered, "claude-opus-5").contextWindow, 1000000);
 		assert.equal(find(registered, "claude-opus-4-8").contextWindow, 1000000);
@@ -150,6 +153,7 @@ describe("applyLongContext", () => {
 
 	it("labels exactly the registered 1M models", () => {
 		const pro = applyLongContext(models, PRO);
+		assert.equal(find(pro, "claude-sonnet-5-5").name, "claude-sonnet-5-5 1M");
 		assert.equal(find(pro, "claude-opus-5-5").name, "claude-opus-5-5 1M");
 		assert.equal(find(pro, "claude-opus-5").name, "claude-opus-5 1M");
 		assert.equal(find(pro, "claude-opus-4-8").name, "claude-opus-4-8 1M");
@@ -165,6 +169,10 @@ describe("applyLongContext", () => {
 
 describe("resolveModel", () => {
 	const models = buildModels(MODEL_IDS_IN_ORDER.map(mockPiAiModel));
+
+	it("sonnet shortcut resolves to claude-sonnet-5-5 (first sonnet in order)", () => {
+		assert.equal(resolveModel(models, "sonnet")?.id, "claude-sonnet-5-5");
+	});
 
 	it("opus shortcut resolves to claude-opus-5-5 (first opus in order)", () => {
 		assert.equal(resolveModel(models, "opus")?.id, "claude-opus-5-5");
@@ -218,6 +226,18 @@ describe("models absent from pi-ai's snapshot", () => {
 	it("requests the 1M runtime id for Fable 5.1", () => {
 		assert.deepEqual(resolveClaudeCodeRuntimeModel("claude-fable-5-1", PRO), {
 			cliModelId: "claude-fable-5-1[1m]", contextWindow: 1000000,
+		});
+	});
+
+	it("derives Sonnet 5.5 from Sonnet 5 and uses its measured 1M request id", () => {
+		const models = buildModels([mockPiAiModel("claude-sonnet-5")]);
+		const derived = find(models, "claude-sonnet-5-5");
+		assert.ok(derived);
+		assert.equal(derived.name, "Claude Sonnet 5.5");
+		assert.equal(derived.maxTokens, 8000, "inherits output limit until pi-ai or a measured override says otherwise");
+		assert.equal(derived.baseUrl, undefined);
+		assert.deepEqual(resolveClaudeCodeRuntimeModel(derived.id, PRO), {
+			cliModelId: "claude-sonnet-5-5[1m]", contextWindow: 1000000,
 		});
 	});
 

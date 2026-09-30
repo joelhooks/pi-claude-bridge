@@ -13,7 +13,12 @@ import type { PromptCaptureSnapshot } from "./prompt-capture.js";
 // The file holds assembled system prompts, so it is private (0600) and lives
 // beside Pi's own session state rather than in the project.
 
-export type WakePrompt = { basePrompt: string; assembledPrompt: string };
+export type WakePrompt = {
+	basePrompt: string;
+	assembledPrompt: string;
+	/** Final typed native prompt, verified against live ordinary-turn options. */
+	nativePrompt?: string;
+};
 export type PromptCaptureCarrier = { version: 1; captures: PromptCaptureSnapshot[]; wakePrompt?: WakePrompt };
 
 const MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
