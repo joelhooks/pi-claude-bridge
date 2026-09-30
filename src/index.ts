@@ -949,15 +949,43 @@ const promptCaptures = new PromptCaptures(256, (diagnostic) => {
  *  no test noticed, because nothing asserted that anything ends clean — so assert it
  *  where the real sessions are, and let diag/audit-warnings.mjs scan for it. */
 function resolveProviderCapture(systemPrompt?: string, promptParts?: readonly string[], resourceSections?: Record<string, string>) {
+	// An idle custom wake can replay the last run's known extension sections
+	// before Pi refreshes its transcript, while getSystemPrompt() exposes the bare
+	// base. This is not stale resource policy when that live base still matches
+	// the recorded base and the request is exactly the recorded final capture.
+	// Do not accept unknown wrappers or a base whose resource bytes changed.
+	const retainedWakeCapture = expectedWakePrompt !== undefined && wakePrompt !== undefined
+		&& isWakeBase(expectedWakePrompt, wakePrompt.basePrompt)
+		&& ([wakePrompt.assembledPrompt, wakePrompt.nativePrompt].some((known) => known !== undefined
+			&& (systemPrompt === known || Boolean(promptParts?.length
+				&& promptParts.join("\n\n") === systemPrompt && isExactPartPermutation(known, promptParts)))));
 	if (expectedWakePrompt !== undefined && systemPrompt !== expectedWakePrompt
+		&& !retainedWakeCapture
 		&& !(promptParts?.length && promptParts.join("\n\n") === systemPrompt && isExactPartPermutation(expectedWakePrompt, promptParts))) {
+		const divergentOffset = (left: string | undefined, right: string | undefined): number => {
+			if (left === undefined || right === undefined) return -1;
+			let offset = 0;
+			while (offset < Math.min(left.length, right.length) && left[offset] === right[offset]) offset++;
+			return offset;
+		};
+		debug("prompt-capture: wake parity diagnostic", {
+			requestLength: systemPrompt?.length, expectedLength: expectedWakePrompt.length,
+			baseLength: wakePrompt?.basePrompt.length, captureLength: wakePrompt?.assembledPrompt.length,
+			requestVsExpected: divergentOffset(systemPrompt, expectedWakePrompt),
+			baseVsExpected: divergentOffset(wakePrompt?.basePrompt, expectedWakePrompt),
+			captureVsRequest: divergentOffset(wakePrompt?.assembledPrompt, systemPrompt),
+			sectionNames: resourceSections ? Object.keys(resourceSections) : [],
+		});
 		throw new Error("prompt-capture: this wake carries an older prompt than Pi's current resource state. "
 			+ "Send an ordinary user message to refresh the capture before retrying the timer/intercom wake. "
 			+ "No request was sent with stale instructions; reload or restart alone is not a capture refresh.");
 	}
 	// A wake skips before_agent_start and Pi restores the base prompt. Only the
 	// recorded base for this session may reuse the finalized policy.
-	const key = wakePrompt && systemPrompt !== undefined && isWakeBase(systemPrompt, wakePrompt.basePrompt)
+	const key = wakePrompt && systemPrompt !== undefined
+		&& (isWakeBase(systemPrompt, wakePrompt.basePrompt) || systemPrompt === wakePrompt.nativePrompt
+			|| Boolean(wakePrompt.nativePrompt && promptParts?.length && promptParts.join("\n\n") === systemPrompt
+				&& isExactPartPermutation(wakePrompt.nativePrompt, promptParts)))
 		? wakePrompt.assembledPrompt : systemPrompt;
 	try {
 		return promptCaptures.resolveOrDerive(key, promptParts);
@@ -2416,18 +2444,44 @@ export default function (pi: ExtensionAPI) {
 			const assembledPrompt = ctx.getSystemPrompt();
 			recordSystemPrompt(assembledPrompt, lastSystemPromptOptions);
 			if (basePromptBeforeHandlers !== undefined) {
-				wakePrompt = { basePrompt: basePromptBeforeHandlers, assembledPrompt };
+				// A tool-loop turn may normalize the options into a new object. Keep
+				// native evidence only while both ends of its verified pair are exact;
+				// re-capturing an unchanged final prompt must not erase that evidence.
+				const nativePrompt = wakePrompt?.basePrompt === basePromptBeforeHandlers
+					&& wakePrompt.assembledPrompt === assembledPrompt ? wakePrompt.nativePrompt : undefined;
+				wakePrompt = { basePrompt: basePromptBeforeHandlers, assembledPrompt,
+					...(nativePrompt !== undefined ? { nativePrompt } : {}) };
 			}
 		}
 	};
 	// Observe Pi's typed state before its forced-prompt projection. This records
 	// section ownership without interpreting XML inside user-supplied text.
-	pi.on("context_with_system", (event) => {
+	pi.on("context_with_system", (event, ctx) => {
 		const state = piAi.getCurrentSystemMessage(event.messages);
 		if (!state?.sections || piAi.contentText(state.content)) return;
 		const sections = Object.fromEntries(Object.entries(state.sections)
 			.filter((entry): entry is [string, string] => typeof entry[1] === "string"));
-		promptCaptures.recordResourceSections(piAi.getCurrentSystemPrompt(event.messages), sections);
+		const nativePrompt = piAi.getCurrentSystemPrompt(event.messages);
+		// Capture the finalized native policy before Pi projects a forced wrapper.
+		// Late structured sections are not necessarily in the base recorded by our
+		// start hook. Only a live user-turn options object can establish this alias;
+		// a cold wake or an arbitrary context rewrite cannot invent one.
+		if (lastSystemPromptOptions && wakePrompt && typeof ctx?.getSystemPrompt === "function") {
+			const forced = lastSystemPromptOptions.forceSystemPrompt;
+			let liveNative: string;
+			try {
+				lastSystemPromptOptions.forceSystemPrompt = undefined;
+				liveNative = ctx.getSystemPrompt();
+			} finally {
+				lastSystemPromptOptions.forceSystemPrompt = forced;
+			}
+			if ((nativePrompt === liveNative || isExactPartPermutation(liveNative, Object.values(sections)))
+				&& wakePrompt.assembledPrompt.includes(nativePrompt)) {
+				recordSystemPrompt(nativePrompt, { ...lastSystemPromptOptions, forceSystemPrompt: undefined });
+				wakePrompt = { ...wakePrompt, nativePrompt };
+			}
+		}
+		promptCaptures.recordResourceSections(nativePrompt, sections);
 	});
 	pi.on("agent_start", captureCurrentPrompt);
 	pi.on("turn_start", captureCurrentPrompt);
