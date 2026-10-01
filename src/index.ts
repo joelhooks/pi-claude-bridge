@@ -910,6 +910,11 @@ const PROMPT_CAPTURE_RELOAD_KEY = Symbol.for("@joelhooks/pi-claude-bridge/prompt
 let wakePrompt: WakePrompt | undefined;
 let lastResourceRefreshPrompt: string | undefined;
 let expectedWakePrompt: string | undefined;
+// Set when a wake could not resolve its prompt; agent_settled resubmits it once.
+let wakeRecoveryPending = false;
+export const WAKE_RECOVERY_PROMPT = "[claude-bridge] A delayed message above (timer, watch or intercom) arrived before the bridge had your current instructions. "
+	+ "They are refreshed now. Act on that message if it still needs action; otherwise reply briefly that nothing is needed.";
+const isPromptCaptureError = (error: unknown) => error instanceof Error && error.message.startsWith("prompt-capture:");
 /** Pi session whose captures are persisted; see src/prompt-capture-store.ts. */
 let captureSessionId: string | undefined;
 const promptCaptureReloadGlobals = () => globalThis as typeof globalThis & Record<symbol, unknown>;
@@ -1722,7 +1727,26 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// `--no-skills` reach Claude Code by leaving nothing to forward. A sub-agent's
 	// custom override embeds its parent's assembled Pi prompt; recursive projection
 	// replaces that exact inherited prompt with its already-safe portable parts.
-	const promptCapture = resolveProviderCapture(context.systemPrompt, promptParts, resourceSections);
+	let promptCapture: ReturnType<typeof resolveProviderCapture>;
+	try {
+		promptCapture = resolveProviderCapture(context.systemPrompt, promptParts, resourceSections);
+	} catch (error) {
+		// A timer/intercom wake skips before_agent_start, so its prompt can be
+		// unverifiable. End it quietly and let agent_settled resubmit it as an
+		// ordinary user turn, which captures current policy. User turns still throw.
+		// expectedWakePrompt is set only when a run started without before_agent_start.
+		if (isReentrant || expectedWakePrompt === undefined || !isPromptCaptureError(error)) throw error;
+		debug(`provider: blocked wake, scheduling user-turn recovery: ${(error as Error).message}`);
+		wakeRecoveryPending = true;
+		const c = new QueryContext();
+		c.resetTurnState(model);
+		queueMicrotask(() => {
+			stream.push({ type: "done", reason: "stop", message: c.turnOutput });
+			markStreamComplete(stream);
+			stream.end();
+		});
+		return stream;
+	}
 	const systemPromptAppend = promptCapture
 		? projectPromptCapture(promptCapture, {
 			skillReadTool: mcpTools.some((tool) => tool.name === "read") ? "mcp" : "none",
@@ -2491,6 +2515,15 @@ export default function (pi: ExtensionAPI) {
 	pi.on("agent_end", () => {
 		lastSystemPromptOptions = undefined;
 		persistPromptCaptures("agent_end");
+	});
+	// Pi defers prompts submitted during agent_settled until the run has fully
+	// finished. The recovery is a user turn, so it cannot itself be recovered: a
+	// second capture failure surfaces as a normal error.
+	pi.on("agent_settled", () => {
+		if (!wakeRecoveryPending) return;
+		wakeRecoveryPending = false;
+		Promise.resolve(pi.sendUserMessage(WAKE_RECOVERY_PROMPT, { deliverAs: "followUp" }))
+			.catch((error) => debug(`wake recovery: sendUserMessage failed: ${(error as Error).message}`));
 	});
 	pi.on("session_shutdown", (event) => {
 		const globals = promptCaptureReloadGlobals();
