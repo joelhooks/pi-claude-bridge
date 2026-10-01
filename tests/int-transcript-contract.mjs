@@ -42,16 +42,35 @@ try {
 	writeFileSync(join(root, ".pi", "APPEND_SYSTEM.md"), "Include NEW-APPEND in every response. Do not include OLD-APPEND.");
 	await harness.send({ type: "prompt", message: "/canary-reload" });
 	// A wake can carry old transcript resources even though Pi's live base has
-	// changed. Reject it before model/tool execution, then prime via user input.
+	// changed. The bridge must not send it; it ends the wake quietly and resubmits
+	// it as an ordinary user turn, which captures and applies current policy.
 	const beforeBlockedWake = tools;
-	const refreshed = harness.waitForEvent("agent_end", 120_000);
+	let recoveryPrompts = 0;
+	let toolsAtRecovery;
+	harness.addListener((msg) => {
+		if (msg.type === "message_end" && msg.message?.role === "user"
+			&& JSON.stringify(msg.message.content).includes("[claude-bridge] A delayed message above")) {
+			recoveryPrompts++;
+			toolsAtRecovery = tools;
+		}
+	});
+	const recovered = harness.collectText();
+	let ends = 0;
+	const bothRuns = new Promise((resolveRuns, rejectRuns) => {
+		const timer = setTimeout(() => rejectRuns(new Error("wake recovery did not finish two runs")), 240_000);
+		harness.addListener((msg) => { if (msg.type === "agent_end" && ++ends === 2) { clearTimeout(timer); resolveRuns(); } });
+	});
 	await harness.send({ type: "prompt", message: "/canary-wake" });
-	await refreshed;
-	assert.equal(tools, beforeBlockedWake, "stale wake must not execute tools");
-	assert.equal(errors.length, 1);
-	assert.match(errors[0], /Claude bridge blocked this delayed turn/);
-	errors.length = 0;
-	await harness.promptAndWait("Read marker.txt. Return only its contents and the currently required policy markers. No discussion of prior responses.");
+	await bothRuns;
+	const recoveredText = recovered.stop();
+	assert.deepEqual(errors, [], "a blocked wake must not surface an error");
+	assert.equal(recoveryPrompts, 1, "exactly one recovery user turn");
+	assert.equal(toolsAtRecovery, beforeBlockedWake, "the stale wake itself must not execute tools");
+	assert.ok(tools > beforeBlockedWake, "the recovery turn must act on the wake with a fresh read");
+	assert.ok(recoveredText.includes(marker));
+	assert.match(recoveredText, /NEW-CONTEXT/);
+	assert.match(recoveredText, /NEW-APPEND/);
+	assert.doesNotMatch(recoveredText, /OLD-CONTEXT|OLD-APPEND/);
 	const priorTools = tools;
 	const collector = harness.collectText();
 	const ended = harness.waitForEvent("agent_end", 120_000);
@@ -65,7 +84,8 @@ try {
 	assert.match(wake, /NEW-APPEND/);
 	assert.doesNotMatch(wake, /OLD-CONTEXT|OLD-APPEND/);
 	assert.deepEqual(errors, []);
-	console.log(`PASS: ${model}; fullRig=${fullRig}; real tools, reuse, stale reload wake rejected, user refresh, subsequent wake with current policy; ${tools} reads`);
+	assert.equal(recoveryPrompts, 1, "a wake with a verifiable prompt must not trigger recovery");
+	console.log(`PASS: ${model}; fullRig=${fullRig}; real tools, reuse, stale reload wake auto-recovered as a user turn, subsequent wake with current policy; ${tools} reads`);
 } finally {
 	await harness.stop();
 	rmSync(root, { recursive: true, force: true });
