@@ -976,9 +976,10 @@ function resolveProviderCapture(systemPrompt?: string, promptParts?: readonly st
 			captureVsRequest: divergentOffset(wakePrompt?.assembledPrompt, systemPrompt),
 			sectionNames: resourceSections ? Object.keys(resourceSections) : [],
 		});
-		throw new Error("prompt-capture: this wake carries an older prompt than Pi's current resource state. "
-			+ "Send an ordinary user message to refresh the capture before retrying the timer/intercom wake. "
-			+ "No request was sent with stale instructions; reload or restart alone is not a capture refresh.");
+		throw new Error("prompt-capture: Claude bridge blocked this delayed turn before contacting Claude. "
+			+ "Its saved prompt does not match the current instructions. "
+			+ "Send a normal message in this pane (for example, 'continue') to refresh the prompt, then check whether the pending work still needs action. "
+			+ "Reloading alone may not refresh the prompt.");
 	}
 	// A wake skips before_agent_start and Pi restores the base prompt. Only the
 	// recorded base for this session may reuse the finalized policy.
@@ -2475,8 +2476,10 @@ export default function (pi: ExtensionAPI) {
 			} finally {
 				lastSystemPromptOptions.forceSystemPrompt = forced;
 			}
+			// The wrapper contains Pi's live rendering; replay may reorder the same
+			// whole sections. Verify ownership against that rendering, not replay order.
 			if ((nativePrompt === liveNative || isExactPartPermutation(liveNative, Object.values(sections)))
-				&& wakePrompt.assembledPrompt.includes(nativePrompt)) {
+				&& wakePrompt.assembledPrompt.includes(liveNative)) {
 				recordSystemPrompt(nativePrompt, { ...lastSystemPromptOptions, forceSystemPrompt: undefined });
 				wakePrompt = { ...wakePrompt, nativePrompt };
 			}
