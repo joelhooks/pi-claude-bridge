@@ -49,7 +49,7 @@ try {
 	await refreshed;
 	assert.equal(tools, beforeBlockedWake, "stale wake must not execute tools");
 	assert.equal(errors.length, 1);
-	assert.match(errors[0], /older prompt than Pi's current resource state/);
+	assert.match(errors[0], /Claude bridge blocked this delayed turn/);
 	errors.length = 0;
 	await harness.promptAndWait("Read marker.txt. Return only its contents and the currently required policy markers. No discussion of prior responses.");
 	const priorTools = tools;

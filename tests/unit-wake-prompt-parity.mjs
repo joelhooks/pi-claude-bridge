@@ -20,7 +20,7 @@ function captureTurn() {
   handlers.get("agent_end")({});
   return { options, bare, assembled };
 }
-function captureLateWrappedTurn() {
+function captureLateWrappedTurn({ reorder = false } = {}) {
   const { options } = captureTurn();
   handlers.get("session_start")({ reason: "new" }, { ui: null, mode: "rpc" });
   options.sections = {};
@@ -30,11 +30,12 @@ function captureLateWrappedTurn() {
   const native = buildSystemPrompt(options);
   options.forceSystemPrompt = `${native}\n\nFORCED-WRAPPER-POLICY`;
   handlers.get("agent_start")({}, { getSystemPrompt: () => buildSystemPrompt(options) });
-  const sections = buildSystemPromptSections(options);
+  const canonicalSections = buildSystemPromptSections(options);
+  const sections = reorder ? Object.fromEntries(Object.entries(canonicalSections).reverse()) : canonicalSections;
   handlers.get("context_with_system")({ messages: [{ role: "system", content: "", sections, timestamp: 0 }] }, { getSystemPrompt: () => buildSystemPrompt(options) });
   assert.equal(options.forceSystemPrompt, `${native}\n\nFORCED-WRAPPER-POLICY`, "must restore the forced options synchronously");
   handlers.get("agent_end")({});
-  return { options, bare, native, sections };
+  return { options, bare, native: reorder ? Object.values(sections).join("\n\n") : native, sections };
 }
 afterEach(() => handlers?.get("session_shutdown")({ reason: "quit" }));
 
@@ -56,6 +57,21 @@ describe("custom wake prompt parity", () => {
     const capture = __test.resolveProviderCapture(native, Object.values(sections), sections);
     const projected = projectPromptCapture(capture, { skillReadTool: "mcp" });
     for (const policy of ["LATE-STRUCTURED-POLICY", "FORCED-WRAPPER-POLICY", "PROJECT-POLICY", "CLI-POLICY"]) assert.ok(projected.includes(policy));
+  });
+
+  it("captures the native alias when transcript section order differs from the forced wrapper", () => {
+    const { bare, native, sections } = captureLateWrappedTurn({ reorder: true });
+    handlers.get("agent_start")({}, { getSystemPrompt: () => bare });
+    const capture = __test.resolveProviderCapture(native, Object.values(sections), sections);
+    const projected = projectPromptCapture(capture, { skillReadTool: "mcp" });
+    for (const policy of ["LATE-STRUCTURED-POLICY", "FORCED-WRAPPER-POLICY", "PROJECT-POLICY", "CLI-POLICY"]) assert.ok(projected.includes(policy));
+  });
+
+  it("rejects instruction drift even after recording a reordered native alias", () => {
+    const { options, native, sections } = captureLateWrappedTurn({ reorder: true });
+    const current = buildSystemPrompt({ ...options, forceSystemPrompt: undefined, sections: {}, appendSystemPrompt: "CHANGED" });
+    handlers.get("agent_start")({}, { getSystemPrompt: () => current });
+    assert.throws(() => __test.resolveProviderCapture(native, Object.values(sections), sections), /Claude bridge blocked this delayed turn/);
   });
 
   it("retains a verified native alias across a tool-loop turn with the same finalized prompt", () => {
@@ -82,14 +98,14 @@ describe("custom wake prompt parity", () => {
     assert.match(projectPromptCapture(__test.resolveProviderCapture(native, Object.values(sections), sections), { skillReadTool: "mcp" }), /FORCED-WRAPPER-POLICY/);
     const changed = { ...sections, "unverified-section": "UNKNOWN" };
     handlers.get("context_with_system")({ messages: [{ role: "system", content: "", sections: changed, timestamp: 0 }] }, { getSystemPrompt: () => bare });
-    assert.throws(() => __test.resolveProviderCapture(Object.values(changed).join("\n\n"), Object.values(changed), changed), /older prompt/);
+    assert.throws(() => __test.resolveProviderCapture(Object.values(changed).join("\n\n"), Object.values(changed), changed), /Claude bridge blocked this delayed turn/);
   });
 
   it("still rejects resource drift when a verified native alias exists", () => {
     const { options, native, sections } = captureLateWrappedTurn();
     const current = buildSystemPrompt({ ...options, forceSystemPrompt: undefined, sections: {}, appendSystemPrompt: "CHANGED" });
     handlers.get("agent_start")({}, { getSystemPrompt: () => current });
-    assert.throws(() => __test.resolveProviderCapture(native, Object.values(sections), sections), /older prompt/);
+    assert.throws(() => __test.resolveProviderCapture(native, Object.values(sections), sections), /Claude bridge blocked this delayed turn/);
   });
 
   it("accepts only an exact permutation of the known retained sections", () => {
@@ -105,7 +121,7 @@ describe("custom wake prompt parity", () => {
     const { bare, assembled } = captureTurn();
     handlers.get("agent_start")({}, { getSystemPrompt: () => bare });
     for (const prompt of [assembled + "\n\nUNKNOWN-POLICY", assembled.slice(0, -1)]) {
-      assert.throws(() => __test.resolveProviderCapture(prompt), /older prompt than Pi's current resource state/);
+      assert.throws(() => __test.resolveProviderCapture(prompt), /Claude bridge blocked this delayed turn/);
     }
   });
 
@@ -115,7 +131,7 @@ describe("custom wake prompt parity", () => {
       const current = buildSystemPrompt({ ...options, sections: {}, ...delta });
       handlers.get("agent_start")({}, { getSystemPrompt: () => current });
       const sections = buildSystemPromptSections(options);
-      assert.throws(() => __test.resolveProviderCapture(assembled, Object.values(sections), sections), /older prompt than Pi's current resource state/);
+      assert.throws(() => __test.resolveProviderCapture(assembled, Object.values(sections), sections), /Claude bridge blocked this delayed turn/);
     }
   });
 
@@ -124,6 +140,6 @@ describe("custom wake prompt parity", () => {
     const current = buildSystemPrompt({ ...options, sections: {}, appendSystemPrompt: "CURRENT-POLICY" });
     handlers.get("agent_start")({}, { getSystemPrompt: () => current });
     const sections = buildSystemPromptSections(options);
-    assert.throws(() => __test.resolveProviderCapture(assembled, Object.values(sections), sections), /older prompt than Pi's current resource state/);
+    assert.throws(() => __test.resolveProviderCapture(assembled, Object.values(sections), sections), /Claude bridge blocked this delayed turn/);
   });
 });

@@ -127,7 +127,7 @@ describe("Pi 0.86 finalized prompt capture", () => {
 		h.get("agent_end")({});
 		const current = buildSystemPrompt({ ...opts, appendSystemPrompt: "CURRENT-POLICY" });
 		h.get("agent_start")({}, { getSystemPrompt: () => current });
-		assert.throws(() => __test.resolveProviderCapture(base), /older prompt than Pi's current resource state/);
+		assert.throws(() => __test.resolveProviderCapture(base), /Claude bridge blocked this delayed turn/);
 	});
 
 	it("cannot refresh unknown or policy-overridden resource sections", () => {
