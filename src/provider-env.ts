@@ -61,18 +61,28 @@ export const leaseSecret: LeaseSecret = (name) => new Promise((resolve, reject) 
 		});
 });
 
-/** Per resolver: missing -> leasing (single flight) -> valid -> expired -> leasing.
+/** A cached lease is reused only while it has at least this long left. Without
+ *  it, a fixed-cadence wake landing exactly one TTL after the lease that served
+ *  an earlier wake passed the cache check and failed the spawn check a few ms
+ *  later (2026-10-07: three owner passes in a row at hh:00:01 / hh:30:01). */
+export const LEASE_REUSE_MARGIN_MS = 5 * 60 * 1000;
+
+/** Per resolver: missing -> leasing (single flight) -> valid -> near expiry -> leasing.
  * Failed leases are not cached. Cancellation detaches a waiter, not its siblings;
  * the bounded CLI call may finish and cache a valid lease for the next spawn. */
 export class ProviderEnvResolver {
 	private readonly cache = new Map<string, SecretLease>();
 	private readonly pending = new Map<string, Promise<SecretLease>>();
 	private readonly expirations = new WeakMap<NodeJS.ProcessEnv, number>();
-	constructor(private readonly lease: LeaseSecret = leaseSecret, private readonly now = Date.now) {}
+	constructor(
+		private readonly lease: LeaseSecret = leaseSecret,
+		private readonly now = Date.now,
+		private readonly reuseMarginMs = LEASE_REUSE_MARGIN_MS,
+	) {}
 
 	private get(name: string): Promise<SecretLease> {
 		const cached = this.cache.get(name);
-		if (cached && cached.expiresAt > this.now()) return Promise.resolve(cached);
+		if (cached && cached.expiresAt - this.now() > this.reuseMarginMs) return Promise.resolve(cached);
 		this.cache.delete(name);
 		const pending = this.pending.get(name);
 		if (pending) return pending;
