@@ -5,8 +5,9 @@
 // returned) so the extension always starts.
 
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
+import { parseProviderEnv, type ProviderEnv } from "./provider-env.js";
 
 export interface Config {
 	/** Date (YYYY-MM-DD) the one-time startup notice was shown. Written by the extension, not the user. */
@@ -26,6 +27,8 @@ export interface Config {
 		strictMcpConfig?: boolean;
 		autoMemoryEnabled?: boolean;
 		pathToClaudeCodeExecutable?: string;
+		/** Spawn-only overlay; string literals or time-bounded agent-secrets leases. */
+		env?: ProviderEnv;
 		// Subscription plan tier. Setting to "max" enables Opus 4.6 at 1M context
 		plan?: "pro" | "max";
 		// Set to true to opt into metered 1M context usage ("extra usage" in
@@ -35,14 +38,24 @@ export interface Config {
 	};
 }
 
-export function tryParseJson(path: string): Partial<Config> {
-	if (!existsSync(path)) return {};
-	try {
-		return JSON.parse(readFileSync(path, "utf-8"));
-	} catch (e) {
-		console.error(`claude-bridge: failed to parse ${path}: ${e}`);
+export function tryParseJson(path: string, failClosed = false): Partial<Config> {
+	const unavailable = (): Partial<Config> => {
+		// Never quote parse/read errors or config contents.
+		if (failClosed) throw new Error("claude-bridge: config unavailable");
+		console.error(`claude-bridge: failed to parse ${path}`);
 		return {};
+	};
+	// Only a missing directory entry is absent. A dangling symlink or a file
+	// disappearing between this check and the read must fail closed at spawn.
+	try { lstatSync(path); } catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
+		return unavailable();
 	}
+	try {
+		const parsed = JSON.parse(readFileSync(path, "utf-8"));
+		if (failClosed && (parsed === null || typeof parsed !== "object" || Array.isArray(parsed))) return unavailable();
+		return parsed;
+	} catch { return unavailable(); }
 }
 
 export function claudeCodeSettings(provider: Config["provider"] = {}): { autoMemoryEnabled: boolean } {
@@ -66,8 +79,8 @@ export function markStartupNoticeShown(): string {
 	if (existsSync(path)) {
 		try {
 			existing = JSON.parse(readFileSync(path, "utf-8"));
-		} catch (e) {
-			console.error(`claude-bridge: leaving ${path} alone, it does not parse: ${e}`);
+		} catch {
+			console.error(`claude-bridge: leaving ${path} alone, it does not parse`);
 			return path;
 		}
 	}
@@ -78,12 +91,17 @@ export function markStartupNoticeShown(): string {
 	return path;
 }
 
-export function loadConfig(cwd: string): Config {
-	const global = tryParseJson(globalConfigPath());
-	const project = tryParseJson(join(cwd, CONFIG_DIR_NAME, "claude-bridge.json"));
+export function loadConfig(cwd: string, failClosed = false): Config {
+	const global = tryParseJson(globalConfigPath(), failClosed);
+	const project = tryParseJson(join(cwd, CONFIG_DIR_NAME, "claude-bridge.json"), failClosed);
+	// Validate both layers before merging: project overrides do not hide bad references.
+	const globalEnv = parseProviderEnv(global.provider?.env);
+	const projectEnv = parseProviderEnv(project.provider?.env);
+	const env = globalEnv === undefined && projectEnv === undefined
+		? undefined : { ...globalEnv, ...projectEnv };
 	return {
 		startupNoticeShown: project.startupNoticeShown ?? global.startupNoticeShown,
 		askClaude: { ...global.askClaude, ...project.askClaude },
-		provider: { ...global.provider, ...project.provider },
+		provider: { ...global.provider, ...project.provider, ...(env === undefined ? {} : { env }) },
 	};
 }
