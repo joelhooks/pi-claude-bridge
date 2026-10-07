@@ -6,12 +6,14 @@
  */
 import { describe, it, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, statSync, writeFileSync, utimesSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, statSync, writeFileSync, utimesSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { buildSystemPrompt, buildSystemPromptSections } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/system-prompt.js";
 import activate, { __test } from "../src/index.js";
 import { projectPromptCapture } from "../src/prompt-capture.js";
-import { loadPromptCaptures, promptCaptureDir, prunePromptCaptures, savePromptCaptures } from "../src/prompt-capture-store.js";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { flushPromptCaptures, loadPromptCaptures, promptCaptureDir, prunePromptCapturesAsync, savePromptCaptures } from "../src/prompt-capture-store.js";
 
 const options = () => ({ cwd: "/fixture", selectedTools: ["read"],
 	contextFiles: [{ path: "/fixture/AGENTS.md", content: "PROJECT-POLICY" }], skills: [],
@@ -110,10 +112,25 @@ describe("persisted prompt captures", () => {
 	});
 });
 
+/** The child keeps the TypeScript loader but not tests/lib/setup.mjs, which would
+ *  point it at a fresh capture directory. */
+const execArgvWithoutSetup = () => {
+	const out = [];
+	for (let i = 0; i < process.execArgv.length; i++) {
+		const arg = process.execArgv[i];
+		if (arg.startsWith("--test")) continue;
+		if (arg === "--import" && /setup\.mjs$/.test(process.execArgv[i + 1] ?? "")) { i++; continue; }
+		if (/^--import=.*setup\.mjs$/.test(arg)) continue;
+		out.push(arg);
+	}
+	return out;
+};
+
 describe("prompt capture store", () => {
-	it("writes private files and refuses ids that could escape the directory", () => {
+	it("writes private files and refuses ids that could escape the directory", async () => {
 		const carrier = { version: 1, captures: [{ assembledPrompt: "P", contextFiles: [], skills: [] }] };
 		assert.equal(savePromptCaptures("ok-id_1", carrier), true);
+		await flushPromptCaptures();
 		assert.equal(statSync(join(promptCaptureDir(), "ok-id_1.json")).mode & 0o777, 0o600);
 		assert.deepEqual(loadPromptCaptures("ok-id_1"), carrier);
 		for (const bad of ["../escape", "a/b", "", "x".repeat(200)]) {
@@ -124,17 +141,43 @@ describe("prompt capture store", () => {
 		assert.equal(existsSync(join(promptCaptureDir(), "empty.json")), false);
 	});
 
-	it("ignores foreign files and prunes month-old captures", () => {
+	it("ignores foreign files and prunes month-old captures", async () => {
 		mkdirSync(promptCaptureDir(), { recursive: true });
 		writeFileSync(join(promptCaptureDir(), "foreign.json"), JSON.stringify({ version: 2 }));
 		assert.equal(loadPromptCaptures("foreign"), undefined);
 		const carrier = { version: 1, captures: [{ assembledPrompt: "P", contextFiles: [], skills: [] }] };
 		savePromptCaptures("old", carrier);
 		savePromptCaptures("recent", carrier);
+		await flushPromptCaptures();
 		const old = new Date(Date.now() - 31 * 24 * 60 * 60 * 1000);
 		utimesSync(join(promptCaptureDir(), "old.json"), old, old);
-		prunePromptCaptures();
+		// Two days ahead: past the daily marker that earlier startups claimed.
+		await prunePromptCapturesAsync(Date.now() + 2 * 24 * 60 * 60 * 1000);
 		assert.equal(loadPromptCaptures("old"), undefined);
 		assert.ok(loadPromptCaptures("recent"));
+	});
+
+	// 2026-10-06 freezes: Pis sat 30-68 s in a synchronous rename on the
+	// main thread during APFS metadata stalls. Saving must not touch the disk inline.
+	it("writes off the main thread and keeps only the newest snapshot", async () => {
+		const first = { version: 1, captures: [{ assembledPrompt: "FIRST", contextFiles: [], skills: [] }] };
+		const second = { version: 1, captures: [{ assembledPrompt: "SECOND", contextFiles: [], skills: [] }] };
+		const file = join(promptCaptureDir(), "async-sess.json");
+		assert.equal(savePromptCaptures("async-sess", first), true);
+		assert.equal(existsSync(file), false, "save returned after touching the disk synchronously");
+		savePromptCaptures("async-sess", second);
+		assert.equal(loadPromptCaptures("async-sess").captures[0].assembledPrompt, "SECOND", "a pending save must be readable");
+		await flushPromptCaptures();
+		assert.equal(JSON.parse(readFileSync(file, "utf8")).captures[0].assembledPrompt, "SECOND");
+		assert.equal((statSync(file).mode & 0o777), 0o600);
+	});
+
+	it("flushes an unwritten save when the process exits", () => {
+		const store = fileURLToPath(new URL("../src/prompt-capture-store.ts", import.meta.url));
+		const child = spawnSync(process.execPath, [...execArgvWithoutSetup(), "--input-type=module", "-e",
+			`const s = await import(${JSON.stringify(store)}); s.savePromptCaptures("exit-sess", { version: 1, captures: [{ assembledPrompt: "EXIT", contextFiles: [], skills: [] }] }); process.exit(0);`],
+			{ env: { ...process.env, CLAUDE_BRIDGE_CAPTURE_DIR: promptCaptureDir() }, encoding: "utf8" });
+		assert.equal(child.status, 0, child.stderr);
+		assert.equal(JSON.parse(readFileSync(join(promptCaptureDir(), "exit-sess.json"), "utf8")).captures[0].assembledPrompt, "EXIT");
 	});
 });

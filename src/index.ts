@@ -18,6 +18,7 @@ import { extractAllToolResults as _extractAllToolResults, type McpResult } from 
 import { QueryContext, ctx } from "./query-state.js";
 import { makePromptStream, userMessage, type PromptStream } from "./prompt-stream.js";
 import { claudeCodeSettings, loadConfig, markStartupNoticeShown, type Config } from "./config.js";
+import { ProviderEnvResolver, type ProviderEnv } from "./provider-env.js";
 import {
 	collectPromptSkills,
 	findBaseSystemPromptLengths,
@@ -37,6 +38,9 @@ import { collectCarriedAttachments, placeCarriedAttachments, type CarriedAttachm
 import { createToolServer } from "./mcp-server.js";
 import { buildActionSummary, type ToolCallState } from "./askclaude-ui.js";
 import { nonSystemMessages, toBridgeContext, transcriptPromptParts } from "./transcript.js";
+import { WAKE_RECOVERY_PROMPT, WakeRecoveryBoundary } from "./wake-dispatch.js";
+export { WAKE_RECOVERY_PROMPT } from "./wake-dispatch.js";
+const wakeRecoveryBoundary = new WakeRecoveryBoundary();
 
 // Compat (#2): use factory if available (pi-ai ≥0.66), else fall back to constructor (gsd-pi etc.)
 const _piAi = piAi as any;
@@ -132,8 +136,9 @@ function debug(...args: unknown[]) {
 // stderr). Without this, CC's internal view of the world is invisible to us
 // and "No conversation found" / empty-error reports are unactionable.
 let nextCliDebugSeq = 1;
-function makeCliDebugOptions(tag: string): { debug?: boolean; debugFile?: string; stderr?: (data: string) => void } {
-	if (!DEBUG) return {};
+function makeCliDebugOptions(tag: string, envConfigured = false): { debug?: boolean; debugFile?: string; stderr?: (data: string) => void } {
+	// Subprocess debug/stderr can contain credentials. Never collect it in env mode.
+	if (!DEBUG || envConfigured) return {};
 	const seq = nextCliDebugSeq++;
 	const ts = new Date().toISOString().replace(/[:.]/g, "-");
 	const logDir = join(dirname(DEBUG_LOG_PATH), "cc-cli-logs");
@@ -186,6 +191,7 @@ const SDK_TO_PI_TOOL_NAME: Record<string, string> = {
 // MODELS is buildModels(getModels("anthropic")) — projection kept in models.js.
 const MODELS = buildModels(getModels("anthropic"));
 let providerSettings: NonNullable<Config["provider"]> = {};
+const providerEnvResolver = new ProviderEnvResolver();
 let longContextSettings: LongContextSettings = { plan: "pro", longContextExtraUsage: false };
 
 function resolveModel(input: string) {
@@ -357,9 +363,7 @@ function extractAllToolResults(context: Context): McpResult[] {
  *  landing in both — an extension appending a display-only user message after
  *  the real one (see issue #34) makes the turn longer than one message. */
 function turnStart(messages: Context["messages"]): number {
-	let i = messages.length;
-	while (i > 0 && messages[i - 1].role === "user") i--;
-	return i;
+	return wakeRecoveryBoundary.turnStart(messages);
 }
 
 /** Extract the current user turn as a prompt string. Returns null if the last message is not a user message. */
@@ -508,16 +512,20 @@ async function runIsolatedSummary(
 		context = toBridgeContext(context);
 		const promptText = extractIsolatedSummaryPrompt(context.messages);
 		const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
-		const compactProviderSettings = loadConfig(cwd).provider;
+		const compactProviderSettings = loadConfig(cwd, true).provider;
 		const claudeExecutable = compactProviderSettings?.pathToClaudeCodeExecutable;
 		const cliModel = claudeCodeModelId(model, longContextSettings);
+		const envConfig = compactProviderSettings?.env;
+		const childEnv = envConfig === undefined ? { ...process.env, ...CC_CHILD_ENV }
+			: await providerEnvResolver.resolve(envConfig, process.env, CC_CHILD_ENV, options?.signal);
 		debug(`compact summary: spawn model=${cliModel} registeredModel=${model.id} promptLen=${promptText.length}`);
 
+		providerEnvResolver.assertFresh(childEnv);
 		sdkQuery = query({
 			prompt: promptText,
 			options: {
 				cwd,
-				env: { ...process.env, ...CC_CHILD_ENV },
+				env: childEnv,
 				settings: { autoMemoryEnabled: false },
 				tools: [],
 				strictMcpConfig: true,
@@ -528,7 +536,7 @@ async function runIsolatedSummary(
 				model: cliModel,
 				maxTurns: 1,
 				...(claudeExecutable ? { pathToClaudeCodeExecutable: claudeExecutable } : {}),
-				...makeCliDebugOptions("compact-summary"),
+				...makeCliDebugOptions("compact-summary", envConfig !== undefined),
 			},
 		});
 
@@ -791,6 +799,9 @@ export const __test = {
 		piUI = ui;
 	},
 	syncSharedSession,
+	turnStart,
+	extractUserPrompt,
+	wakeRecoveryBoundary,
 	toBridgeContext,
 	resolveMcpTools,
 	extractIsolatedSummaryPrompt,
@@ -806,6 +817,9 @@ export const __test = {
 	CC_CHILD_ENV,
 	buildMcpServers,
 	branchSummaryOutcome,
+	streamClaudeAgentSdk,
+	isolatedStreamFn,
+	promptAndWait,
 };
 
 // --- Provider helpers: tool name mapping ---
@@ -912,8 +926,9 @@ let lastResourceRefreshPrompt: string | undefined;
 let expectedWakePrompt: string | undefined;
 // Set when a wake could not resolve its prompt; agent_settled resubmits it once.
 let wakeRecoveryPending = false;
-export const WAKE_RECOVERY_PROMPT = "[claude-bridge] A delayed message above (timer, watch or intercom) arrived before the bridge had your current instructions. "
-	+ "They are refreshed now. Act on that message if it still needs action; otherwise reply briefly that nothing is needed.";
+// A normal turn can combine an opaque wrapper with later typed policy. Hook
+// errors are swallowed by Pi, so retain this rejection at the provider boundary.
+let promptCompositionError: Error | undefined;
 const isPromptCaptureError = (error: unknown) => error instanceof Error && error.message.startsWith("prompt-capture:");
 /** Pi session whose captures are persisted; see src/prompt-capture-store.ts. */
 let captureSessionId: string | undefined;
@@ -953,7 +968,9 @@ const promptCaptures = new PromptCaptures(256, (diagnostic) => {
  *  ack. The activeQueryContexts leak was present on every single happy-path run and
  *  no test noticed, because nothing asserted that anything ends clean — so assert it
  *  where the real sessions are, and let diag/audit-warnings.mjs scan for it. */
-function resolveProviderCapture(systemPrompt?: string, promptParts?: readonly string[], resourceSections?: Record<string, string>) {
+function resolveProviderCapture(requestPrompt?: string, promptParts?: readonly string[], resourceSections?: Record<string, string>) {
+	const systemPrompt = withoutWakeMcpServers(requestPrompt);
+	if (promptCompositionError) throw promptCompositionError;
 	// An idle custom wake can replay the last run's known extension sections
 	// before Pi refreshes its transcript, while getSystemPrompt() exposes the bare
 	// base. This is not stale resource policy when that live base still matches
@@ -1014,6 +1031,7 @@ function resolveProviderCapture(systemPrompt?: string, promptParts?: readonly st
 
 /** One or more whole blocks exactly as Pi renders `systemPromptOptions.sections`. */
 const TRAILING_SECTIONS = /^(?:\n\n<([A-Za-z0-9_-]+)>\n[\s\S]*?\n<\/\1>)+$/;
+const MCP_SERVERS_BLOCK = /^\n\n<mcp_servers>\n[\s\S]*\n<\/mcp_servers>$/;
 
 /**
  * Whether a wake's prompt is the recorded base. Extensions that run before the
@@ -1027,6 +1045,18 @@ function isWakeBase(prompt: string, recordedBase: string): boolean {
 	return prompt.length < recordedBase.length
 		&& recordedBase.startsWith(prompt)
 		&& TRAILING_SECTIONS.test(recordedBase.slice(prompt.length));
+}
+
+/**
+ * Pi's MCP extension keeps its `mcp_servers` section in the shared prompt
+ * options once a server connects, so a later wake renders that block after a
+ * base recorded without it. User turns reach the bridge without it, so drop
+ * exactly that trailing block and resolve the wake as its user turn would.
+ */
+function withoutWakeMcpServers(prompt: string | undefined): string | undefined {
+	if (prompt === undefined || expectedWakePrompt === undefined || expectedWakePrompt.includes("\n<mcp_servers>\n")) return prompt;
+	return prompt.startsWith(expectedWakePrompt) && MCP_SERVERS_BLOCK.test(prompt.slice(expectedWakePrompt.length))
+		? expectedWakePrompt : prompt;
 }
 
 function reportLeaks(label: string): void {
@@ -1641,6 +1671,8 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		? Object.fromEntries(Object.entries(systemState.sections).filter((entry): entry is [string, string] => typeof entry[1] === "string"))
 		: undefined;
 	context = toBridgeContext(context);
+	// Also reject concurrent/reentrant replay while execution outcome is unknown.
+	wakeRecoveryBoundary.assertNotRetired(context.messages);
 	// Pi's one-off summarizers (including /bug) deliberately disable caching
 	// and carry one user request without tools. Never send them into the live
 	// Claude conversation or try to resolve them as a captured agent prompt.
@@ -1712,10 +1744,23 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	}
 
 	// --- Fresh query ---
+	const spawnCwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
+	let envConfig: ProviderEnv | undefined;
+	try { envConfig = loadConfig(spawnCwd, true).provider?.env; }
+	catch (error) {
+		stream.push({ type: "error", reason: "error", error: newAssistantOutput(model, "", "error", errorMessage(error)) });
+		markStreamComplete(stream);
+		stream.end();
+		return stream;
+	}
+	// Resolve before claiming/resetting a QueryContext. While a lease is pending,
+	// another spawn can start; re-evaluate reentrancy when this spawn is ready.
+	const startQuery = (resolvedEnv: NodeJS.ProcessEnv) => {
+	wakeRecoveryBoundary.assertNotRetired(context.messages);
 
 	// 1. Determine reentrancy. Reentrant queries get their own QueryContext so
 	//    background subagents can run concurrently with the parent query.
-	const isReentrant = activeQuery;
+	const isReentrant = ctx().activeQuery !== null;
 	const queryCtx = isReentrant ? new QueryContext() : ctx();
 	debug(`provider: fresh query setup, isReentrant=${isReentrant}, activeContexts=${activeQueryContexts.size}`);
 
@@ -1735,11 +1780,21 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		// unverifiable. End it quietly and let agent_settled resubmit it as an
 		// ordinary user turn, which captures current policy. User turns still throw.
 		// expectedWakePrompt is set only when a run started without before_agent_start.
-		if (isReentrant || expectedWakePrompt === undefined || !isPromptCaptureError(error)) throw error;
+		if (isReentrant || expectedWakePrompt === undefined || !isPromptCaptureError(error)) {
+			if (!isReentrant) {
+				wakeRecoveryPending = false;
+				wakeRecoveryBoundary.invalidate();
+			}
+			throw error;
+		}
 		debug(`provider: blocked wake, scheduling user-turn recovery: ${(error as Error).message}`);
 		wakeRecoveryPending = true;
 		const c = new QueryContext();
 		c.resetTurnState(model);
+		// This output is a policy barrier, not an inferred assistant reply.
+		// Its process-local capability keeps the original wake in the current
+		// recovery prompt instead of importing an unfinished user tail into CC.
+		wakeRecoveryBoundary.markBlocked(c.turnOutput!, context.messages);
 		queueMicrotask(() => {
 			stream.push({ type: "done", reason: "stop", message: c.turnOutput });
 			markStreamComplete(stream);
@@ -1752,6 +1807,17 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			skillReadTool: mcpTools.some((tool) => tool.name === "read") ? "mcp" : "none",
 		})
 		: undefined;
+
+	// Retired recovery contexts fail before history sync and SDK construction.
+	// A fresh ordinary prompt is explicit new authority, never an automatic retry.
+	const recoveredWake = !isReentrant && wakeRecoveryBoundary.prepare(context.messages);
+	if (recoveredWake && sharedSession) {
+		// Actual SDK/CC resume retains its previous append-system-prompt on reuse.
+		// Recovery has just verified CURRENT policy. Import priors into a new
+		// session so that policy reaches the wire; leave the old saved history
+		// untouched (forceRotate prevents the rebuild's in-place delete/save).
+		sharedSession = { ...sharedSession, needsRebuild: true, forceRotate: true };
+	}
 
 	// 2. Fresh child context — constructor already gave us clean Maps and empty
 	//    arrays. For a reused top-level context, clear explicitly.
@@ -1773,6 +1839,9 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	const { sessionId: resumeSessionId } = syncResult;
 	const promptBlocks = extractUserPromptBlocks(context.messages);
 	let promptText = extractUserPrompt(context.messages) ?? "";
+	// All three history/text/image splits above used the same boundary. Consume
+	// it once before dispatch, so a replayed suffix cannot re-run the old wake.
+	if (!isReentrant) wakeRecoveryBoundary.consume(context.messages);
 
 	// Mid-turn continuation: the rebuild above wrote pi's compacted history, tool
 	// results and all, so the transcript now ends on a tool_result carrier. With
@@ -1876,7 +1945,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// also autocompact would double-flush the prompt cache and races pi's
 	// threshold with CC's, including CC's anti-thrashing guard (issue #8).
 	// Manual /compact in CC still works (we never invoke it).
-	const childEnv = { ...process.env, ...CC_CHILD_ENV, ...(resumeInterruptedTurn ? CC_RESUME_INTERRUPTED_TURN_ENV : {}) };
+	const childEnv = { ...resolvedEnv, ...(resumeInterruptedTurn ? CC_RESUME_INTERRUPTED_TURN_ENV : {}) };
 	const queryOptions: NonNullable<Parameters<typeof query>[0]["options"]> = {
 		cwd,
 		env: childEnv,
@@ -1907,7 +1976,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		...(toolListingHooks ? { hooks: toolListingHooks } : {}),
 		...(resumeSessionId ? { resume: resumeSessionId } : {}),
 		...(claudeExecutable ? { pathToClaudeCodeExecutable: claudeExecutable } : {}),
-		...makeCliDebugOptions("provider"),
+		...makeCliDebugOptions("provider", envConfig !== undefined),
 	};
 
 	debug("provider: fresh query",
@@ -1919,6 +1988,15 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 
 	// 3. Start SDK query and claim it for this context
 	let wasAborted = false;
+	try {
+		providerEnvResolver.assertFresh(resolvedEnv);
+		if (envConfig !== undefined && options?.signal?.aborted) throw new Error("claude-bridge: provider.env resolution aborted");
+	} catch (error) {
+		promptStream.fail(new Error("provider environment unavailable"));
+		if (queryCtx.promptStream === promptStream) queryCtx.promptStream = null;
+		if (queryCtx.currentPiStream === stream) queryCtx.currentPiStream = null;
+		throw error;
+	}
 	const sdkQuery = query({ prompt: promptStream.stream, options: queryOptions });
 	gatedQuery = sdkQuery;
 	queryCtx.activeQuery = sdkQuery;
@@ -2035,7 +2113,19 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// underneath the query needs too. `done` resolves after the finally above, so
 	// an awaiting caller sees the context out of activeQueryContexts.
 	queryCtx.teardown = () => { onAbort(); return done; };
-
+	return stream;
+	};
+	// No env block: original synchronous spawn path, no lease or extra microtask.
+	if (envConfig === undefined) return startQuery({ ...process.env, ...CC_CHILD_ENV });
+	void providerEnvResolver.resolve(envConfig, process.env, CC_CHILD_ENV, options?.signal)
+		.then((env) => startQuery(env))
+		.catch((error) => {
+			// Resolution failures never spawn or fall back to stored Claude login.
+			const reason = options?.signal?.aborted ? "aborted" : "error";
+			stream.push({ type: "error", reason, error: newAssistantOutput(model, "", reason, errorMessage(error)) });
+			markStreamComplete(stream);
+			stream.end();
+		});
 	return stream;
 }
 
@@ -2208,11 +2298,15 @@ async function promptAndWait(
 	// removes the Skill tool and the listing with it — but AskClaude runs on CC's native
 	// tools, so it has to be asked for. Pi-side skills still arrive via skillsBlock below,
 	// which is meant to be the only channel.
+	const envConfig = loadConfig(cwd, true).provider?.env;
+	const childEnv = envConfig === undefined ? { ...process.env, ...CC_CHILD_ENV }
+		: await providerEnvResolver.resolve(envConfig, process.env, CC_CHILD_ENV, signal);
+	providerEnvResolver.assertFresh(childEnv);
 	const sdkQuery = query({
 		prompt,
 		options: {
 			cwd,
-			env: { ...process.env, ...CC_CHILD_ENV },
+			env: childEnv,
 			permissionMode: "bypassPermissions",
 			settings: { ...claudeCodeSettings(providerSettings), claudeMdExcludes: CLAUDE_MD_EXCLUDES },
 			skills: [],
@@ -2227,7 +2321,7 @@ async function promptAndWait(
 			...(resumeSessionId ? { resume: resumeSessionId } : {}),
 			...(options?.isolated ? { persistSession: false } : {}),
 			...(claudeExecutable ? { pathToClaudeCodeExecutable: claudeExecutable } : {}),
-			...makeCliDebugOptions("askclaude"),
+			...makeCliDebugOptions("askclaude", envConfig !== undefined),
 		},
 	});
 
@@ -2329,7 +2423,7 @@ export default function (pi: ExtensionAPI) {
 	process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1";
 
 	const config = loadConfig(process.cwd());
-	debug("loadConfig:", JSON.stringify(config));
+	debug("loadConfig: loaded"); // Never serialize config: arbitrary env literals may be credentials.
 	providerSettings = config.provider ?? {};
 	// We need these settings to know if we're eligible for 1M context on certain models
 	longContextSettings = {
@@ -2352,12 +2446,15 @@ export default function (pi: ExtensionAPI) {
 		debug(`${event}: clearing session ${sharedSession?.sessionId?.slice(0, 8) ?? "none"}`);
 		sharedSession = null;
 		promptCaptures.clear();
+		promptCompositionError = undefined;
 		lastSystemPromptOptions = undefined;
 		basePromptBeforeHandlers = undefined;
 		wakePrompt = undefined;
 		lastResourceRefreshPrompt = undefined;
 		expectedWakePrompt = undefined;
 		midTurnContinuation = null;
+		wakeRecoveryPending = false;
+		wakeRecoveryBoundary.clear();
 
 		// Clear the global streamSimple if this instance registered it.
 		// This allows /reload to work — the old instance clears the flag so
@@ -2409,10 +2506,33 @@ export default function (pi: ExtensionAPI) {
 	// `--system-prompt` replaces pi's default rather than adding to it, but Claude
 	// Code's preset carries its own tool and permission guidance that the bridge
 	// still depends on, so both flags are forwarded as an append.
-	function recordSystemPrompt(systemPrompt: string, options: BuildSystemPromptOptions): void {
-		// A full replacement owns its instructions. When it wraps an earlier
-		// capture, the existing inheritance graph projects that embedded prompt.
+	function recordSystemPrompt(systemPrompt: string, options: BuildSystemPromptOptions, nativePrompt?: string): void {
+		// Bind ordinary wrappers to the current native rendering, in either hook
+		// order. Never infer ownership from policy-looking tags inside the wrapper.
 		if (options.forceSystemPrompt !== undefined) {
+			const mcpBlock = options.sections?.mcp_servers
+				? `\n\n<mcp_servers>\n${options.sections.mcp_servers}\n</mcp_servers>` : undefined;
+			const nativeWithoutMcp = mcpBlock && nativePrompt?.endsWith(mcpBlock)
+				? nativePrompt.slice(0, -mcpBlock.length) : undefined;
+			if (nativePrompt !== undefined && nativePrompt !== systemPrompt && systemPrompt.includes(nativePrompt)) {
+				recordSystemPrompt(nativePrompt, { ...options, forceSystemPrompt: undefined });
+			} else if (nativeWithoutMcp !== undefined && systemPrompt.includes(nativeWithoutMcp)) {
+				// Built-in MCP runs after legacy wrappers. Its late discovery section
+				// is excluded by this runtime's ordinary provider projection as well.
+				// Certify the entire counterfactual native rendering, not selected tags:
+				// any other missing typed policy still fails the terminal guard below.
+				const { mcp_servers: _discovery, ...sections } = options.sections ?? {};
+				recordSystemPrompt(nativeWithoutMcp, {
+					...options, sections, forceSystemPrompt: undefined,
+				});
+			} else if (nativePrompt !== undefined && nativePrompt !== systemPrompt && Object.values(options.sections ?? {}).some(Boolean)) {
+				promptCompositionError = new Error("Claude bridge blocked an unsupported prompt composition before contacting Claude. "
+					+ "A forced wrapper does not contain the current native prompt with its typed policy sections. "
+					+ "Compose those sections before wrapping, or use typed prompt sections throughout, then send an ordinary message. "
+					+ "No automatic wake recovery can repair this ordering.");
+				return;
+			}
+			// A genuine standalone replacement still owns its instructions.
 			if (!promptCaptures.resolve(systemPrompt)) {
 				promptCaptures.record(systemPrompt, { custom: systemPrompt, contextFiles: [], skills: [] });
 			}
@@ -2438,6 +2558,7 @@ export default function (pi: ExtensionAPI) {
 		});
 	}
 	pi.on("before_agent_start", (event) => {
+		promptCompositionError = undefined;
 		expectedWakePrompt = undefined;
 		lastSystemPromptOptions = event.systemPromptOptions;
 		basePromptBeforeHandlers = event.systemPrompt;
@@ -2457,7 +2578,7 @@ export default function (pi: ExtensionAPI) {
 					lastSystemPromptOptions.forceSystemPrompt = forced;
 				}
 			}
-			recordSystemPrompt(event.systemPrompt, lastSystemPromptOptions);
+			recordSystemPrompt(event.systemPrompt, lastSystemPromptOptions, basePromptBeforeHandlers);
 		}
 	});
 	// Pi 0.86 can widen tools and mutate prompt options after our start hook.
@@ -2467,7 +2588,17 @@ export default function (pi: ExtensionAPI) {
 		if (!lastSystemPromptOptions) expectedWakePrompt = ctx.getSystemPrompt();
 		if (lastSystemPromptOptions) {
 			const assembledPrompt = ctx.getSystemPrompt();
-			recordSystemPrompt(assembledPrompt, lastSystemPromptOptions);
+			let nativePrompt: string | undefined;
+			const forced = lastSystemPromptOptions.forceSystemPrompt;
+			if (forced !== undefined) {
+				try {
+					lastSystemPromptOptions.forceSystemPrompt = undefined;
+					nativePrompt = ctx.getSystemPrompt();
+				} finally {
+					lastSystemPromptOptions.forceSystemPrompt = forced;
+				}
+			}
+			recordSystemPrompt(assembledPrompt, lastSystemPromptOptions, nativePrompt);
 			if (basePromptBeforeHandlers !== undefined) {
 				// A tool-loop turn may normalize the options into a new object. Keep
 				// native evidence only while both ends of its verified pair are exact;
@@ -2523,7 +2654,10 @@ export default function (pi: ExtensionAPI) {
 		if (!wakeRecoveryPending) return;
 		wakeRecoveryPending = false;
 		Promise.resolve(pi.sendUserMessage(WAKE_RECOVERY_PROMPT, { deliverAs: "followUp" }))
-			.catch((error) => debug(`wake recovery: sendUserMessage failed: ${(error as Error).message}`));
+			.catch((error) => {
+				wakeRecoveryBoundary.invalidate();
+				debug(`wake recovery: sendUserMessage failed: ${(error as Error).message}`);
+			});
 	});
 	pi.on("session_shutdown", (event) => {
 		const globals = promptCaptureReloadGlobals();
@@ -2600,7 +2734,11 @@ export default function (pi: ExtensionAPI) {
 		midTurnContinuation = midTurn ? label : null;
 		if (midTurn) debug(`${label}: history ends inside a tool loop — next provider call continues the turn from the rebuilt session`);
 	});
-	pi.on("session_tree", () => markRebuild("session_tree"));
+	pi.on("session_tree", () => {
+		wakeRecoveryPending = false;
+		wakeRecoveryBoundary.invalidate();
+		markRebuild("session_tree");
+	});
 
 	// Branch summarization — rewind or fork-at-point with "summarize" — is the other
 	// place pi asks the model for a summary, and unlike compaction it runs through
