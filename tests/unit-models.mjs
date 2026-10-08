@@ -72,6 +72,53 @@ describe("MODELS projection", () => {
 	});
 });
 
+describe("Claude Haiku 5.5", () => {
+	// pi-ai catalogs released before Haiku 5.5 carry Opus 5.5 but not Haiku 5.5.
+	const opus55 = {
+		...oneM("claude-opus-5-5"), name: "Claude Opus 5.5", input: ["text", "image"], maxTokens: 128000,
+		thinkingLevelMap: { off: null, minimal: null, low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" },
+	};
+	const preHaikuCatalog = [opus55, mockPiAiModel("claude-haiku-4-5")];
+
+	it("is offered when pi-ai predates it, with its own identity and Opus 5.5's verified shape", () => {
+		const haiku = find(buildModels(preHaikuCatalog), "claude-haiku-5-5");
+		assert.ok(haiku, "claude-haiku-5-5 missing from the model list");
+		assert.equal(haiku.name, "Claude Haiku 5.5");
+		assert.equal(haiku.contextWindow, 1000000);
+		assert.equal(haiku.maxTokens, 128000);
+		assert.deepEqual(haiku.input, ["text", "image"]);
+		assert.equal(haiku.reasoning, true);
+		assert.deepEqual(haiku.thinkingLevelMap, opus55.thinkingLevelMap);
+		assert.deepEqual(haiku.cost, { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
+	});
+
+	it("lists before Haiku 4.5", () => {
+		const ids = buildModels(preHaikuCatalog).map((m) => m.id);
+		assert.deepEqual(ids, ["claude-opus-5-5", "claude-haiku-5-5", "claude-haiku-4-5"]);
+	});
+
+	it("prefers pi-ai's own entry once it ships one", () => {
+		const native = { ...oneM("claude-haiku-5-5"), name: "native" };
+		assert.equal(find(buildModels([opus55, native]), "claude-haiku-5-5").name, "native");
+	});
+
+	it("is dropped, not invented, when its base is missing too", () => {
+		assert.equal(find(buildModels([mockPiAiModel("claude-haiku-4-5")]), "claude-haiku-5-5"), undefined);
+	});
+
+	it("asks Claude Code for the 1M window on every plan", () => {
+		for (const settings of [PRO, MAX, EXTRA]) {
+			assert.deepEqual(resolveClaudeCodeRuntimeModel("claude-haiku-5-5", settings), { cliModelId: "claude-haiku-5-5[1m]", contextWindow: 1000000 });
+		}
+	});
+
+	it("registers and labels 1M", () => {
+		const haiku = find(applyLongContext(buildModels(preHaikuCatalog), PRO), "claude-haiku-5-5");
+		assert.equal(haiku.contextWindow, 1000000);
+		assert.equal(haiku.name, "Claude Haiku 5.5 1M");
+	});
+});
+
 describe("Claude Code runtime model policy", () => {
 	it("uses measured Pro defaults", () => {
 		assert.deepEqual(resolveClaudeCodeRuntimeModel("claude-sonnet-5-5", PRO), { cliModelId: "claude-sonnet-5-5[1m]", contextWindow: 1000000 });
@@ -178,8 +225,8 @@ describe("resolveModel", () => {
 		assert.equal(resolveModel(models, "opus")?.id, "claude-opus-5-5");
 	});
 
-	it("haiku shortcut resolves to claude-haiku-4-5", () => {
-		assert.equal(resolveModel(models, "haiku")?.id, "claude-haiku-4-5");
+	it("haiku shortcut resolves to claude-haiku-5-5 (first haiku in order)", () => {
+		assert.equal(resolveModel(models, "haiku")?.id, "claude-haiku-5-5");
 	});
 
 	it("full ID resolves to itself", () => {
