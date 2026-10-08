@@ -11,6 +11,9 @@ export const DERIVED_FROM: Record<string, { from: string; name: string; maxToken
 	"claude-fable-5-1": { from: "claude-fable-5", name: "Claude Fable 5.1" },
 	"claude-opus-5-5": { from: "claude-opus-5", name: "Claude Opus 5.5", maxTokens: 128_000 },
 	"claude-sonnet-5-5": { from: "claude-sonnet-5", name: "Claude Sonnet 5.5" },
+	// Same shape as Opus 5.5: 1M context, 128K output, adaptive thinking with
+	// effort low..max. Only price and speed differ, and the bridge zeroes cost.
+	"claude-haiku-5-5": { from: "claude-opus-5-5", name: "Claude Haiku 5.5", maxTokens: 128_000 },
 };
 
 function deriveMissing<T extends { id: string; [key: string]: any }>(piAiModels: T[], id: string): T | undefined {
@@ -20,7 +23,7 @@ function deriveMissing<T extends { id: string; [key: string]: any }>(piAiModels:
 	return base ? { ...base, ...rule, id, name: rule.name } : undefined;
 }
 
-export const MODEL_IDS_IN_ORDER = ["claude-fable-5-1", "claude-fable-5", "claude-opus-5-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-5-5", "claude-sonnet-5", "claude-sonnet-4-6", "claude-haiku-4-5"];
+export const MODEL_IDS_IN_ORDER = ["claude-fable-5-1", "claude-fable-5", "claude-opus-5-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-5-5", "claude-sonnet-5", "claude-sonnet-4-6", "claude-haiku-5-5", "claude-haiku-4-5"];
 
 // Project pi-ai's model entries down to the fields pi's registerProvider expects,
 // and keep MODEL_IDS_IN_ORDER ordering. IDs missing from pi-ai are silently dropped.
@@ -86,6 +89,11 @@ export function resolveClaudeCodeRuntimeModel(modelId: string, settings: LongCon
 				cliModelId: settings.longContextExtraUsage ? "claude-sonnet-4-6[1m]" : "claude-sonnet-4-6",
 				contextWindow: settings.longContextExtraUsage ? ONE_M_CONTEXT : TWO_HUNDRED_K_CONTEXT,
 			};
+		// Claude Code builds that predate Haiku 5.5 treat the bare id as unknown,
+		// assume 200K and refuse larger prompts client-side. [1m] gets the 1M
+		// window on old and new builds alike.
+		case "claude-haiku-5-5":
+			return { cliModelId: "claude-haiku-5-5[1m]", contextWindow: ONE_M_CONTEXT };
 		case "claude-haiku-4-5":
 			return { cliModelId: "claude-haiku-4-5", contextWindow: TWO_HUNDRED_K_CONTEXT };
 		default:
