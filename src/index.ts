@@ -525,7 +525,12 @@ async function runIsolatedSummary(
 		const envConfig = compactProviderSettings?.env;
 		const childEnv = envConfig === undefined ? { ...process.env, ...CC_CHILD_ENV }
 			: await providerEnvResolver.resolve(envConfig, process.env, CC_CHILD_ENV, options?.signal);
-		debug(`compact summary: spawn model=${cliModel} registeredModel=${model.id} promptLen=${promptText.length}`);
+		// Same mapping as a provider turn: Pi's compaction and branch summaries pass
+		// the session's thinking level.
+		const effort = options?.reasoning
+			? ((model as any).thinkingLevelMap?.[options.reasoning] as EffortLevel | undefined) ?? REASONING_TO_EFFORT[options.reasoning]
+			: undefined;
+		debug(`compact summary: spawn model=${cliModel} registeredModel=${model.id} effort=${effort ?? "default"} promptLen=${promptText.length}`);
 
 		providerEnvResolver.assertFresh(childEnv);
 		sdkQuery = query({
@@ -542,6 +547,7 @@ async function runIsolatedSummary(
 				systemPrompt: context.systemPrompt,
 				model: cliModel,
 				maxTurns: 1,
+				...(effort ? { effort } : {}),
 				...(claudeExecutable ? { pathToClaudeCodeExecutable: claudeExecutable } : {}),
 				...makeCliDebugOptions("compact-summary", envConfig !== undefined),
 			},
@@ -555,6 +561,7 @@ async function runIsolatedSummary(
 		let assistantText = "";
 		let finalText = "";
 		let errorText: string | undefined;
+		let resultUsage: Record<string, number | undefined> | undefined;
 		let firstEventLogged = false;
 
 		for await (const message of sdkQuery) {
@@ -571,6 +578,7 @@ async function runIsolatedSummary(
 			} else if (message.type === "result") {
 				logServedContextWindow("compact summary", message, model);
 				errorText = resultErrorText(message);
+				resultUsage = (message as { usage?: Record<string, number | undefined> }).usage;
 				if (!errorText && message.subtype === "success") finalText = message.result || assistantText;
 			}
 		}
@@ -593,7 +601,10 @@ async function runIsolatedSummary(
 		}
 
 		debug(`compact summary: done textLen=${text.length}`);
-		stream.push({ type: "done", reason: "stop", message: newAssistantOutput(model, text, "stop") });
+		const output = newAssistantOutput(model, text, "stop");
+		// Pi adds this to its session totals; without it every summary counts 0 tokens.
+		if (resultUsage) updateUsage(output, resultUsage, model);
+		stream.push({ type: "done", reason: "stop", message: output });
 		stream.end();
 	} catch (err) {
 		const msg = errorMessage(err);
