@@ -38,6 +38,7 @@ import { collectCarriedAttachments, placeCarriedAttachments, type CarriedAttachm
 import { createToolServer } from "./mcp-server.js";
 import { buildActionSummary, type ToolCallState } from "./askclaude-ui.js";
 import { nonSystemMessages, toBridgeContext, transcriptPromptParts } from "./transcript.js";
+import { prefixDigest } from "./history-digest.js";
 import { WAKE_RECOVERY_PROMPT, WakeRecoveryBoundary } from "./wake-dispatch.js";
 export { WAKE_RECOVERY_PROMPT } from "./wake-dispatch.js";
 const wakeRecoveryBoundary = new WakeRecoveryBoundary();
@@ -181,6 +182,8 @@ function diagDump(label: string, data: Record<string, unknown>) {
 // On session_shutdown (including /reload), clearSession() resets this so a fresh
 // registration can occur for the next session.
 const ACTIVE_STREAM_SIMPLE_KEY = Symbol.for("claude-bridge:activeStreamSimple");
+// pi.events channel answering `claude-bridge:capabilities?` (see announceCapabilities).
+const CAPABILITIES_CHANNEL = "claude-bridge:capabilities";
 
 // Claude Code's own builtin tools, for the AskClaude path where CC really runs
 // them. The provider path never sees these — it starts CC with `tools: []`.
@@ -257,6 +260,10 @@ interface SessionState {
 	// this — there's no concurrent CC writer during those events, so
 	// in-place rebuild (preserve UUID, deleteSession + createSession) is safe.
 	forceRotate?: boolean;
+	// Digest of the Pi history [0..cursor) this session was built or advanced
+	// from (history-digest.ts). Absent when that history was not in hand, which
+	// falls back to the count-only check.
+	prefix?: string;
 }
 
 /**
@@ -696,24 +703,32 @@ function syncSharedSession(
 	cwd: string,
 	customToolNameToSdk?: Map<string, string>,
 	modelId?: string,
+	{ topLevel = false }: { topLevel?: boolean } = {},
 ): SyncResult {
 	const history = nonSystemMessages(messages);
 	const priorMessages = history.slice(0, turnStart(history)); // everything before the current user turn
 
-	// REUSE path
+	// Is Pi's history still the one the shared session was built from? A count
+	// alone says yes to an in-place edit (Pi 1.x `context_edit`), so the content
+	// of [0..cursor) has to match as well.
 	//
 	// Guard on priorMessages.length >= cursor: a shorter incoming context cannot
 	// be a continuation of the cached session. This is the general invariant for
 	// pi-side history rewrites such as /compact and session_tree: without it,
 	// missed = [].slice(cursor) can falsely hit REUSE and resume an unrelated
 	// longer CC session. See issue #25.
-	if (sharedSession && !sharedSession.needsRebuild && priorMessages.length >= sharedSession.cursor) {
+	const continues = sharedSession !== null && !sharedSession.needsRebuild
+		&& priorMessages.length >= sharedSession.cursor
+		&& (sharedSession.prefix === undefined || prefixDigest(priorMessages, sharedSession.cursor) === sharedSession.prefix);
+
+	// REUSE path
+	if (sharedSession && continues) {
 		const missed = priorMessages.slice(sharedSession.cursor);
 		const trailingAssistantOnly =
 			missed.length === 1 && (missed[0] as { role?: string }).role === "assistant";
 		if (missed.length === 0 || trailingAssistantOnly) {
 			if (trailingAssistantOnly) {
-				sharedSession = { ...sharedSession, cursor: priorMessages.length, cwd };
+				sharedSession = { ...sharedSession, cursor: priorMessages.length, cwd, prefix: prefixDigest(priorMessages, priorMessages.length) };
 			}
 			debug(`Case 3: ${trailingAssistantOnly ? "advanced cursor past trailing assistant, " : ""}resuming session ${sharedSession.sessionId.slice(0, 8)}, cursor=${sharedSession.cursor}`);
 			debug(`syncResult: path=reuse sessionId=${sharedSession.sessionId} cursor=${sharedSession.cursor}`);
@@ -731,13 +746,17 @@ function syncSharedSession(
 	// It is NOT, despite an earlier comment here, the isolated compact-summary
 	// path: runIsolatedSummary never calls syncSharedSession at all.
 	//
-	// Only reachable when needsRebuild is false — user-facing history rewrites
-	// (/compact, session_tree, /new, fork) always set needsRebuild or clear
-	// sharedSession before the next syncSharedSession call.
-	if (sharedSession && !sharedSession.needsRebuild && priorMessages.length < sharedSession.cursor) {
-		debug(`Case 1 synthetic: clean start for shorter context, preserving shared session ${sharedSession.sessionId.slice(0, 8)}, cursor=${sharedSession.cursor}`);
+	// Only for nested queries. The top-level conversation's own history can
+	// shrink or change without any event the bridge sees (a compaction or edit
+	// an extension appends at a Pi 1.x turn boundary), and it then has to be
+	// rebuilt, not answered from no history at all.
+	if (sharedSession && !sharedSession.needsRebuild && !continues && !topLevel) {
+		debug(`Case 1 synthetic: clean start for a nested query whose context does not continue the shared session ${sharedSession.sessionId.slice(0, 8)}, cursor=${sharedSession.cursor}, priors=${priorMessages.length}`);
 		debug(`syncResult: path=clean-start preserve-shared sessionId=${sharedSession.sessionId} cursor=${sharedSession.cursor}`);
 		return { sessionId: null, preserveSharedSession: true };
+	}
+	if (sharedSession && !sharedSession.needsRebuild && !continues) {
+		debug(`history rewritten under shared session ${sharedSession.sessionId.slice(0, 8)} (cursor=${sharedSession.cursor}, priors=${priorMessages.length}), rebuilding`);
 	}
 
 	// REBUILD path
@@ -770,7 +789,7 @@ function syncSharedSession(
 	// records, not messages: `messages` filters out the attachment records that
 	// carrying an `@file` expansion across a rebuild writes into the same file.
 	verifyWrittenSession(session.jsonlPath, session.sessionId, session.records.length, cwd);
-	sharedSession = { sessionId: session.sessionId, cursor: priorMessages.length, cwd };
+	sharedSession = { sessionId: session.sessionId, cursor: priorMessages.length, cwd, prefix: prefixDigest(priorMessages, priorMessages.length) };
 	if (previousSessionId === undefined) {
 		debug(`Case 2: first turn with ${priorMessages.length} prior messages → session ${session.sessionId.slice(0, 8)}, ${session.records.length} records`);
 	} else if (preserveId) {
@@ -784,10 +803,47 @@ function syncSharedSession(
 	return { sessionId: session.sessionId };
 }
 
+// Record that Claude Code's transcript now covers Pi's history up to `cursor`.
+// Keeps the digest when the cursor has not moved (a tool-result delivery already
+// recorded it); otherwise digests the history in hand, or drops back to the
+// count-only check when the cursor reaches past it.
+function advanceSharedSession(sessionId: string, messages: Context["messages"], cursor: number, cwd: string): void {
+	const prefix = sharedSession?.sessionId === sessionId && sharedSession.cursor === cursor
+		? sharedSession.prefix
+		: prefixDigest(nonSystemMessages(messages), cursor);
+	sharedSession = { sessionId, cursor, cwd, ...(prefix === undefined ? {} : { prefix }) };
+}
+
+/** Whether Pi's history no longer starts with what the shared session holds:
+ *  something rewrote or shortened it since the session was built or advanced. */
+function sharedPrefixChanged(messages: Context["messages"]): boolean {
+	if (!sharedSession || sharedSession.prefix === undefined) return false;
+	return prefixDigest(nonSystemMessages(messages), sharedSession.cursor) !== sharedSession.prefix;
+}
+
+/** Whether a provider call comes from this Pi session's own agent, rather than a
+ *  subagent session reusing this provider. Unknown ids count as our own. */
+function isOwnPiSession(options?: SimpleStreamOptions): boolean {
+	const sessionId = (options as { sessionId?: string } | undefined)?.sessionId;
+	return !sessionId || !captureSessionId || sessionId === captureSessionId;
+}
+
+async function forwardStream(from: AssistantMessageEventStream, to: AssistantMessageEventStream): Promise<void> {
+	for await (const event of from) to.push(event);
+	to.end();
+}
+
 // @internal
 export const __test = {
 	resetSharedSession() {
 		sharedSession = null;
+	},
+	advanceSharedSession,
+	sharedPrefixChanged,
+	consumeMidTurnContinuation() {
+		const label = midTurnContinuation;
+		midTurnContinuation = null;
+		return label;
 	},
 	setSharedSession(state: SessionState | null) {
 		sharedSession = state;
@@ -1665,6 +1721,7 @@ function drainForAbort(c: QueryContext, promptStream: PromptStream): void {
  *  Two cases: tool result delivery (active query) or fresh query. */
 function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
 	showStartupNoticeOnce();
+	const piContext = context;
 	const promptParts = transcriptPromptParts(context);
 	const systemState = piAi.getCurrentSystemMessage(context.messages);
 	const resourceSections = systemState?.sections && !piAi.contentText(systemState.content)
@@ -1695,6 +1752,26 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// Pi appends tool results to context and calls back. Extract this turn's results
 	// (everything after the last assistant message) and match against waiting MCP
 	// handlers. Results that arrive before their handler get queued in pendingResults.
+	// The live Claude Code process holds the history it started from. If Pi's
+	// history was rewritten underneath it since (an extension's boundary
+	// compaction or context_edit, which fire no event the bridge sees), feeding
+	// it these results would carry on from the old transcript. Treat it like a
+	// mid-turn session_compact: release the live query, then continue the turn
+	// from a session rebuilt from Pi's current history.
+	if (resultCtx && resultCtx === ctx() && sharedSession && !sharedSession.needsRebuild && sharedPrefixChanged(context.messages)) {
+		const label = "history-rewrite";
+		debug(`${label}: Pi's history changed under the live query (cursor=${sharedSession.cursor}, msgs=${context.messages.length}) — continuing the turn from a rebuilt session`);
+		sharedSession = { ...sharedSession, needsRebuild: true };
+		midTurnContinuation = label;
+		void tearDownLiveQueryForCompaction(label)
+			.then(() => forwardStream(streamClaudeAgentSdk(model, piContext, options), stream))
+			.catch((error) => {
+				stream.push({ type: "error", reason: "error", error: newAssistantOutput(model, "", "error", errorMessage(error)) });
+				markStreamComplete(stream);
+				stream.end();
+			});
+		return stream;
+	}
 	if (resultCtx) {
 		claimCurrentPiStream(stream, "tool-result", resultCtx);
 		resultCtx.resetTurnState(model);
@@ -1710,7 +1787,10 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		// delivering its own results would drag it to that subagent's message count
 		// — observed pulling a parent from 5 back to 3, which cost the parent's next
 		// turn a full rebuild and a flushed prompt cache.
-		if (sharedSession && resultCtx === ctx()) sharedSession.cursor = context.messages.length;
+		if (sharedSession && resultCtx === ctx()) {
+			sharedSession.cursor = context.messages.length;
+			sharedSession.prefix = prefixDigest(context.messages, context.messages.length);
+		}
 		resultCtx.latestCursor = Math.max(resultCtx.latestCursor, context.messages.length);
 		return stream;
 	}
@@ -1728,7 +1808,10 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	const lastMsg = context.messages[context.messages.length - 1];
 	if (lastMsg?.role === "toolResult" && !continuation) {
 		debug(`provider: orphaned tool result after abort, emitting end_turn`);
-		if (sharedSession && activeQueryContexts.size === 0) sharedSession.cursor = context.messages.length;
+		if (sharedSession && activeQueryContexts.size === 0) {
+			sharedSession.cursor = context.messages.length;
+			sharedSession.prefix = prefixDigest(context.messages, context.messages.length);
+		}
 		// No query owns this result, so there is no context to reset: resetTurnState
 		// on the top-level ctx() would replace a live parent's turnOutput mid-stream,
 		// stranding the blocks it had already emitted. A throwaway context just
@@ -1835,7 +1918,10 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// cliModel is the actual id sent to Claude Code (may carry [1m]); model.id is the
 	// pi-registered id. Log cliModel so debug lines reflect what CC actually received.
 	const cliModel = claudeCodeModelId(model, longContextSettings);
-	const syncResult = syncSharedSession(context.messages, cwd, customToolNameToSdk, cliModel);
+	// Only the conversation this Pi session is having may rebuild the shared
+	// session from a rewritten history. Nested queries and other sessions' agents
+	// get a clean start instead (see syncSharedSession).
+	const syncResult = syncSharedSession(context.messages, cwd, customToolNameToSdk, cliModel, { topLevel: !isReentrant && isOwnPiSession(options) });
 	const { sessionId: resumeSessionId } = syncResult;
 	const promptBlocks = extractUserPromptBlocks(context.messages);
 	let promptText = extractUserPrompt(context.messages) ?? "";
@@ -2053,7 +2139,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			} else if (sessionId) {
 				const cursor = Math.max(context.messages.length, queryCtx.latestCursor, sharedSession?.cursor ?? 0);
 				debug(`provider: query done, session=${sessionId.slice(0, 8)}, cursor=${cursor}`);
-				sharedSession = { sessionId, cursor, cwd };
+				advanceSharedSession(sessionId, context.messages, cursor, cwd);
 			}
 
 			if (!isReentrant && queryCtx.activeQuery === sdkQuery) {
@@ -2441,6 +2527,15 @@ export default function (pi: ExtensionAPI) {
 	let lastSystemPromptOptions: BuildSystemPromptOptions | undefined;
 	let basePromptBeforeHandlers: string | undefined;
 
+	// Extensions that own compaction for this session, from `compaction:claim`.
+	const compactionClaims = new Set<string>();
+	let sessionBranch: (() => Parameters<typeof branchEndsOnToolResult>[0]) | undefined;
+	// Extensions that rewrite history check this before relying on the bridge to
+	// pass the rewrite on; an older bridge never answers, so they fail safe.
+	const announceCapabilities = () => {
+		pi.events?.emit(CAPABILITIES_CHANNEL, { v: 1, historyRewrite: 1, boundaryEvent: "flowing-view:boundary", compactionClaim: true });
+	};
+
 	// Reset shared session on pi session lifecycle events
 	const clearSession = (event: string) => {
 		debug(`${event}: clearing session ${sharedSession?.sessionId?.slice(0, 8) ?? "none"}`);
@@ -2466,9 +2561,11 @@ export default function (pi: ExtensionAPI) {
 		}
 	};
 	pi.on("session_start", (event, ctx) => {
+		announceCapabilities();
 		piUI = ctx.ui;
 		piMode = ctx.mode;
 		captureSessionId = ctx?.sessionManager?.getSessionId?.();
+		sessionBranch = () => ctx.sessionManager.getBranch();
 		const globals = promptCaptureReloadGlobals();
 		if (event.reason === "reload") {
 			const carrier = globals[PROMPT_CAPTURE_RELOAD_KEY];
@@ -2669,10 +2766,20 @@ export default function (pi: ExtensionAPI) {
 		}
 		reportLeaks("session_shutdown");
 		clearSession("session_shutdown");
+		// A claimant re-claims at its next session_start; one that crashed must
+		// not leave the takeover switched off.
+		compactionClaims.clear();
+		sessionBranch = undefined;
 	});
 
 	pi.on("session_before_compact", async (event, ctx) => {
 		if (ctx.model?.baseUrl !== "claude-bridge") return undefined;
+		// Another extension compacts this session itself. A Claude Code summary
+		// here would either be thrown away or replace its compaction.
+		if (compactionClaims.size > 0) {
+			debug(`session_before_compact: deferring to compaction claim by ${[...compactionClaims].join(", ")}`);
+			return undefined;
+		}
 		debug(
 			`session_before_compact: takeover reason=${event.reason} willRetry=${event.willRetry} ` +
 			`isSplitTurn=${event.preparation.isSplitTurn} messages=${event.preparation.messagesToSummarize.length} ` +
@@ -2726,14 +2833,34 @@ export default function (pi: ExtensionAPI) {
 	// query from the rebuilt history instead of treating them as orphans. The
 	// overflow-retry compaction (willRetry) continues the turn the same way after
 	// CC's own request failed on context size.
-	pi.on("session_compact", async (event, ctx) => {
-		const label = `session_compact:${event.reason}:willRetry=${event.willRetry}`;
+	const rebuildAfterRewrite = async (label: string, midTurnHint: boolean, branch?: Parameters<typeof branchEndsOnToolResult>[0]) => {
 		markRebuild(label);
 		await tearDownLiveQueryForCompaction(label);
-		const midTurn = event.willRetry || branchEndsOnToolResult(ctx.sessionManager.getBranch());
+		const midTurn = midTurnHint || (branch !== undefined && branchEndsOnToolResult(branch));
 		midTurnContinuation = midTurn ? label : null;
 		if (midTurn) debug(`${label}: history ends inside a tool loop — next provider call continues the turn from the rebuilt session`);
+	};
+	pi.on("session_compact", async (event, ctx) => {
+		await rebuildAfterRewrite(`session_compact:${event.reason}:willRetry=${event.willRetry}`, event.willRetry, ctx.sessionManager.getBranch());
 	});
+
+	// Extensions that rewrite history at Pi 1.x turn boundaries (compactions,
+	// context_edit replacements) fire no event of Pi's own. The next provider call
+	// would catch the change by content anyway; the signal releases a live query
+	// at once, the way session_compact does. Payload beyond midTurn is for logs.
+	pi.events?.on("flowing-view:boundary", (data) => {
+		const payload = (data ?? {}) as { reason?: unknown; midTurn?: unknown };
+		void rebuildAfterRewrite(`flowing-view:boundary:${String(payload.reason ?? "unspecified")}`, payload.midTurn === true, sessionBranch?.());
+	});
+	pi.events?.on("compaction:claim", (data) => {
+		const owner = (data as { owner?: unknown } | undefined)?.owner;
+		if (typeof owner === "string" && owner) compactionClaims.add(owner);
+	});
+	pi.events?.on("compaction:release", (data) => {
+		const owner = (data as { owner?: unknown } | undefined)?.owner;
+		if (typeof owner === "string") compactionClaims.delete(owner);
+	});
+	pi.events?.on(`${CAPABILITIES_CHANNEL}?`, () => announceCapabilities());
 	pi.on("session_tree", () => {
 		wakeRecoveryPending = false;
 		wakeRecoveryBoundary.invalidate();
