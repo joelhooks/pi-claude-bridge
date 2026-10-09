@@ -96,6 +96,36 @@ describe("Pi 0.86 finalized prompt capture", () => {
 		assert.doesNotMatch(result, /operating inside pi|Pi documentation/);
 	});
 
+	// 2026-10-09: two fresh Muster workers had their first prompt refused. An
+	// extension wrapped Pi's prompt in before_agent_start; a later one changed the
+	// active tools (ssh_* out, codemode in) before the request, so Pi's own
+	// rendering moved on and the wrapper held the old one. From the second turn the
+	// tools are settled before the wrapper is built, which is why only first turns broke.
+	it("rebases a wrapper onto Pi's current prompt when Pi re-renders after wrapping", () => {
+		const h = setup(); const opts = options();
+		opts.sections.fixture = "TYPED-POLICY";
+		opts.promptGuidelines = ["Use ssh_read for files on the remote host."];
+		opts.forceSystemPrompt = `${buildSystemPrompt(opts)}\n\nWRAPPER-POLICY`;
+		const forced = opts.forceSystemPrompt;
+		h.get("before_agent_start")({ get systemPrompt() { return buildSystemPrompt(opts); }, systemPromptOptions: opts });
+		opts.promptGuidelines = ["Use codemode to batch independent tool calls."];
+		h.get("agent_start")({}, { getSystemPrompt: () => buildSystemPrompt(opts) });
+
+		const result = projectPromptCapture(__test.resolveProviderCapture(forced), { skillReadTool: "mcp" });
+		for (const text of ["WRAPPER-POLICY", "PROJECT-POLICY", "CLI-POLICY", "TYPED-POLICY", "Use codemode to batch"]) assert.ok(result.includes(text), `missing ${text}`);
+		assert.doesNotMatch(result, /ssh_read/, "the wrapper's stale copy of Pi's tool guidance must not reach Claude");
+		assert.doesNotMatch(result, /operating inside pi|Pi documentation/);
+	});
+
+	it("still refuses a wrapper that holds neither Pi's current prompt nor the one it started from", () => {
+		const h = setup(); const opts = options();
+		opts.sections.fixture = "TYPED-POLICY";
+		h.get("before_agent_start")({ get systemPrompt() { return buildSystemPrompt(opts); }, systemPromptOptions: opts });
+		opts.forceSystemPrompt = "A WRAPPER BUILT FROM SOMETHING ELSE\n\n<fixture>\nTYPED-POLICY\n</fixture>";
+		h.get("agent_start")({}, { getSystemPrompt: () => buildSystemPrompt(opts) });
+		assert.throws(() => __test.resolveProviderCapture(opts.forceSystemPrompt), /unsupported prompt composition/);
+	});
+
 	it("refreshes typed resource sections after reload without stale policy or lost wrapper instructions", () => {
 		const h = setup(); const opts = options(); const base = buildSystemPrompt(opts);
 		opts.promptGuidelines = ["CLI-POLICY"]; // Same bytes in a distinct source must survive removal of the append.

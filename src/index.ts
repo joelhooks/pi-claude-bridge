@@ -2614,7 +2614,7 @@ export default function (pi: ExtensionAPI) {
 	// `--system-prompt` replaces pi's default rather than adding to it, but Claude
 	// Code's preset carries its own tool and permission guidance that the bridge
 	// still depends on, so both flags are forwarded as an append.
-	function recordSystemPrompt(systemPrompt: string, options: BuildSystemPromptOptions, nativePrompt?: string): void {
+	function recordSystemPrompt(systemPrompt: string, options: BuildSystemPromptOptions, nativePrompt?: string, wrappedBase?: string): void {
 		// Bind ordinary wrappers to the current native rendering, in either hook
 		// order. Never infer ownership from policy-looking tags inside the wrapper.
 		if (options.forceSystemPrompt !== undefined) {
@@ -2633,6 +2633,19 @@ export default function (pi: ExtensionAPI) {
 				recordSystemPrompt(nativeWithoutMcp, {
 					...options, sections, forceSystemPrompt: undefined,
 				});
+			} else if (nativePrompt !== undefined && wrappedBase !== undefined && wrappedBase !== nativePrompt
+				&& systemPrompt.indexOf(wrappedBase) !== -1
+				&& systemPrompt.indexOf(wrappedBase) === systemPrompt.lastIndexOf(wrappedBase)) {
+				// The wrapper was built around Pi's rendering at before_agent_start,
+				// and Pi re-rendered its own prompt since (a later extension changed
+				// the active tools). Swap the stale copy for the current rendering,
+				// keep the wrapper's own text, and project that: Claude gets current
+				// policy, not tool guidance that no longer applies.
+				recordSystemPrompt(nativePrompt, { ...options, forceSystemPrompt: undefined });
+				const rebased = systemPrompt.replace(wrappedBase, () => nativePrompt);
+				debug(`prompt capture: rebased a wrapper onto Pi's re-rendered prompt (${wrappedBase.length} → ${nativePrompt.length} chars)`);
+				promptCaptures.record(systemPrompt, { custom: rebased, contextFiles: [], skills: [] });
+				return;
 			} else if (nativePrompt !== undefined && nativePrompt !== systemPrompt && Object.values(options.sections ?? {}).some(Boolean)) {
 				promptCompositionError = new Error("Claude bridge blocked an unsupported prompt composition before contacting Claude. "
 					+ "A forced wrapper does not contain the current native prompt with its typed policy sections. "
@@ -2706,7 +2719,7 @@ export default function (pi: ExtensionAPI) {
 					lastSystemPromptOptions.forceSystemPrompt = forced;
 				}
 			}
-			recordSystemPrompt(assembledPrompt, lastSystemPromptOptions, nativePrompt);
+			recordSystemPrompt(assembledPrompt, lastSystemPromptOptions, nativePrompt, basePromptBeforeHandlers);
 			if (basePromptBeforeHandlers !== undefined) {
 				// A tool-loop turn may normalize the options into a new object. Keep
 				// native evidence only while both ends of its verified pair are exact;
