@@ -34,7 +34,7 @@ describe("cache health", () => {
 
 	it("alerts once per session and hour at the threshold, naming the trigger", () => {
 		const f = fixture();
-		const lines = [reply(0, { read: 0, write: 200_000 })];
+		const lines = [JSON.stringify({ type: "session_info", id: "a1", timestamp: at(0), name: "🏛️ Busy · owner" }), reply(0, { read: 0, write: 200_000 })];
 		for (let i = 1; i <= 10; i++) lines.push(goal(i * 2 - 0.5), reply(i * 2, { read: 44_000, write: 200_000 + i }));
 		writeFileSync(f.file, lines.join("\n") + "\n");
 		const opts = { sessions: join(f.root, "sessions"), state: f.state, threshold: 10, host: "test", now: NOW };
@@ -42,7 +42,7 @@ describe("cache health", () => {
 		const first = scan(opts);
 		assert.equal(first.events, 11);
 		assert.equal(first.alerts.length, 1);
-		assert.deepEqual({ ...first.alerts[0], at: undefined }, { v: 1, at: undefined, host: "test", session: "busy-desk",
+		assert.deepEqual({ ...first.alerts[0], at: undefined }, { v: 1, at: undefined, host: "test", session: "busy-desk", name: "🏛️ Busy · owner",
 			hour: "2026-10-11T04:00Z", fullRewrites: 10, rewriteWriteTokens: 2_000_055, topTrigger: "pi-codex-goal" });
 		const summary = JSON.parse(readFileSync(join(f.state, "summary.json"), "utf8"));
 		assert.equal(summary.sessions[0].fullRewrites, 10);

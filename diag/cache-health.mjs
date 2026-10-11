@@ -85,6 +85,7 @@ export function scan(opts) {
 	mkdirSync(opts.state, { recursive: true, mode: 0o700 });
 	const statePath = join(opts.state, "state.json");
 	const state = existsSync(statePath) ? JSON.parse(readFileSync(statePath, "utf8")) : { files: {}, seen: {}, alerted: {} };
+	state.names ??= {};
 	const firstRun = Object.keys(state.files).length === 0;
 	const since = firstRun ? opts.now - (opts.lookbackMs ?? FIRST_RUN_LOOKBACK_MS) : 0;
 	const events = [];
@@ -101,6 +102,11 @@ export function scan(opts) {
 				continue;
 			}
 			const offset = forEachAppendedLine(file, fileState.offset, (line) => {
+				// The session's display name (its callsign), so an alert says who it is.
+				if (line.startsWith('{"type":"session_info"')) {
+					try { const name = JSON.parse(line).name; if (name) state.names[sessionName(file)] = name; } catch {}
+					return;
+				}
 				// Cheap prefilter: only messages matter, and most bytes are tool output.
 				if (!line.includes('message"')) return; // "message" and "custom_message"
 				let entry;
@@ -145,13 +151,13 @@ export function scan(opts) {
 		appendFileSync(join(opts.state, `events-${e.t.slice(0, 7)}.jsonl`), JSON.stringify(e) + "\n");
 	}
 
-	const summary = summarize(opts);
+	const summary = summarize(opts, state.names);
 	const alerts = [];
 	for (const row of summary.sessions) {
 		const key = `${row.host}|${row.session}|${row.hour}`;
 		if (row.fullRewrites < opts.threshold || state.alerted[key]) continue;
 		state.alerted[key] = opts.now;
-		alerts.push({ v: 1, at: new Date(opts.now).toISOString(), host: row.host, session: row.session, hour: row.hour,
+		alerts.push({ v: 1, at: new Date(opts.now).toISOString(), host: row.host, session: row.session, name: row.name, hour: row.hour,
 			fullRewrites: row.fullRewrites, rewriteWriteTokens: row.rewriteWriteTokens, topTrigger: row.topTrigger });
 	}
 	for (const [key, at] of Object.entries(state.alerted)) if (opts.now - at > SEEN_TTL_MS) delete state.alerted[key];
@@ -163,7 +169,7 @@ export function scan(opts) {
 }
 
 /** Per session and UTC hour over the last 24 hours of events. */
-export function summarize(opts) {
+export function summarize(opts, names = {}) {
 	const cutoff = opts.now - 24 * 3600_000;
 	const months = new Set([new Date(cutoff).toISOString().slice(0, 7), new Date(opts.now).toISOString().slice(0, 7)]);
 	const rows = new Map();
@@ -188,6 +194,7 @@ export function summarize(opts) {
 	}
 	const sessions = [...rows.values()].map((row) => ({
 		...row,
+		name: names[row.session] ?? null,
 		hitPct: row.promptTokens ? Math.round(row.readTokens / row.promptTokens * 1000) / 10 : null,
 		writesPerRewrite: row.fullRewrites ? Math.round(row.rewriteWriteTokens / row.fullRewrites) : null,
 		topTrigger: Object.entries(row.triggers).sort((a, b) => b[1] - a[1])[0]?.[0] ?? null,
