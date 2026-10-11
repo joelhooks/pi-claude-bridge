@@ -1,11 +1,15 @@
 #!/usr/bin/env node
 // Stands in for Claude Code on the isolated summary route: answers the SDK's
 // control requests, replies to the first user message with a fixed summary and a
-// result carrying known usage, and records its argv to $FAKE_CLAUDE_ARGV.
+// result carrying known usage, and records its argv to $FAKE_CLAUDE_ARGV (and the
+// cache switch it was started with to $FAKE_CLAUDE_ARGV.env).
 import { appendFileSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 
-if (process.env.FAKE_CLAUDE_ARGV) writeFileSync(process.env.FAKE_CLAUDE_ARGV, JSON.stringify(process.argv.slice(2)));
+if (process.env.FAKE_CLAUDE_ARGV) {
+	writeFileSync(process.env.FAKE_CLAUDE_ARGV, JSON.stringify(process.argv.slice(2)));
+	writeFileSync(`${process.env.FAKE_CLAUDE_ARGV}.env`, JSON.stringify({ DISABLE_PROMPT_CACHING: process.env.DISABLE_PROMPT_CACHING ?? null }));
+}
 const send = (message) => process.stdout.write(JSON.stringify(message) + "\n");
 const session_id = "00000000-0000-4000-8000-000000000001";
 const log = (line) => process.env.FAKE_CLAUDE_LOG && appendFileSync(process.env.FAKE_CLAUDE_LOG, line + "\n");
