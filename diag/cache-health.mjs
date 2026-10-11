@@ -23,6 +23,7 @@ import { homedir, hostname } from "node:os";
 import { basename, join } from "node:path";
 
 const FULL_REWRITE = { maxGapMs: 5 * 60_000, minPrompt: 50_000, minShare: 0.5 };
+const WAKE_RECOVERY_MARK = "[claude-bridge] A delayed message above";
 const FIRST_RUN_LOOKBACK_MS = 2 * 3600_000;
 const SEEN_TTL_MS = 48 * 3600_000;
 
@@ -106,11 +107,18 @@ export function scan(opts) {
 				try { entry = JSON.parse(line); } catch { return; }
 				const message = entry.message;
 				if (message?.role !== "assistant" || message.provider !== "claude-bridge") {
-					if (entry.type === "message" || entry.type === "custom_message") fileState.trigger = entry.customType ?? message?.role ?? entry.type;
+					// The bridge's wake-recovery prompt names the cause; notes that follow it don't.
+					if (message?.role === "user" && line.includes(WAKE_RECOVERY_MARK)) fileState.trigger = "wake-recovery";
+					else if ((entry.type === "message" || entry.type === "custom_message") && fileState.trigger !== "wake-recovery") {
+						fileState.trigger = entry.customType ?? message?.role ?? entry.type;
+					}
 					return;
 				}
 				const t = Date.parse(entry.timestamp);
 				const usage = message.usage ?? {};
+				// No tokens means nothing reached Claude (a parked wake, a turn refused
+				// before sending): not a request, and no reason the cache stayed warm.
+				if (!((usage.input ?? 0) + (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0) + (usage.output ?? 0))) return;
 				const gapMs = fileState.lastT === undefined ? undefined : t - fileState.lastT;
 				const full = isFullRewrite(gapMs, usage);
 				const trigger = fileState.trigger ?? "start";
