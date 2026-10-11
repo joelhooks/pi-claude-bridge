@@ -1095,6 +1095,7 @@ export const __test = {
 		piUI = ui;
 	},
 	syncSharedSession,
+	tearDownLiveQueryForCompaction,
 	notePromptSnapshot,
 	persistSharedSession,
 	setAppendSessionEntry(sink: typeof appendSessionEntry) {
@@ -2554,12 +2555,35 @@ function hasRebuildableToolTail(messages: Context["messages"]): boolean {
  *  waiting for tool results; releasing it lets the next provider call rebuild a
  *  session from the compacted history instead. No-op when nothing is live — a
  *  /compact at a turn boundary, or auto-compaction before a new prompt. */
-async function tearDownLiveQueryForCompaction(label: string): Promise<void> {
+const COMPACTION_TEARDOWN_TIMEOUT_MS = 10_000;
+
+/** Kill the top-level query pi has just compacted underneath (see above).
+ *  Bounded: Pi awaits this inside its compaction, and a query that never
+ *  settles would leave the session "compacting" with no output and no way out
+ *  but a model switch. Past the bound, drop the query's state so the next call
+ *  is not mistaken for a nested one, and rebuild from a fresh session.
+ *  Resolves true when the query settled in time. */
+async function tearDownLiveQueryForCompaction(label: string, timeoutMs = COMPACTION_TEARDOWN_TIMEOUT_MS): Promise<boolean> {
 	const c = ctx();
-	if (!c.teardown) return;
+	if (!c.teardown) return true;
 	debug(`${label}: tearing down live query (pendingToolCalls=${c.pendingToolCalls.size}) — its Claude Code process holds the pre-compaction transcript`);
-	await c.teardown();
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const settled = await Promise.race([
+		c.teardown().then(() => true, () => true),
+		new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), timeoutMs); }),
+	]);
+	clearTimeout(timer);
+	if (!settled) {
+		debug(`${label}: live query did not settle within ${timeoutMs}ms; abandoning it`);
+		c.releasePendingToolCalls("Query abandoned after compaction");
+		c.activeQuery = null;
+		c.teardown = null;
+		activeQueryContexts.delete(c);
+		if (sharedSession) sharedSession = { ...sharedSession, needsRebuild: true, forceRotate: true };
+		return false;
+	}
 	debug(`${label}: live query released, activeContexts=${activeQueryContexts.size}`);
+	return true;
 }
 
 /** Whether the session branch, after compaction, ends on a tool result — i.e.
@@ -3129,13 +3153,17 @@ export default function (pi: ExtensionAPI) {
 	// CC's own request failed on context size.
 	const rebuildAfterRewrite = async (label: string, midTurnHint: boolean, branch?: Parameters<typeof branchEndsOnToolResult>[0]) => {
 		markRebuild(label);
-		await tearDownLiveQueryForCompaction(label);
+		const settled = await tearDownLiveQueryForCompaction(label);
 		const midTurn = midTurnHint || (branch !== undefined && branchEndsOnToolResult(branch));
 		midTurnContinuation = midTurn ? label : null;
 		if (midTurn) debug(`${label}: history ends inside a tool loop — next provider call continues the turn from the rebuilt session`);
+		return settled;
 	};
 	pi.on("session_compact", async (event, ctx) => {
-		await rebuildAfterRewrite(`session_compact:${event.reason}:willRetry=${event.willRetry}`, event.willRetry, ctx.sessionManager.getBranch());
+		const settled = await rebuildAfterRewrite(`session_compact:${event.reason}:willRetry=${event.willRetry}`, event.willRetry, ctx.sessionManager.getBranch());
+		if (!settled) {
+			ctx.ui?.notify?.("Claude bridge: the Claude Code process did not stop after compaction; abandoned it and continuing from a fresh session.", "warning");
+		}
 	});
 
 	// Extensions that rewrite history at Pi 1.x turn boundaries (compactions,
