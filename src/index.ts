@@ -8,7 +8,7 @@ import { Type } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
 import { createSession, deleteSession, getSessionPath, openSession, repairToolPairing } from "cc-session-io";
 import { createHash } from "crypto";
-import { appendFileSync, mkdirSync, readFileSync, realpathSync, statSync } from "fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync } from "fs";
 import { homedir } from "os";
 import { dirname, join } from "path";
 import { PROVIDER_ID, messageContentToText, convertPiMessages } from "./convert.js";
@@ -498,6 +498,15 @@ function describeRateLimitFailure(rejection: { rateLimitType?: string; resetsAt?
 	return `Claude rate limit${kind}${resets}: ${failure}`;
 }
 
+/** Claude Code is spawned in `cwd`. When that directory is gone (a worker clone
+ *  removed under a running Pi), the spawn fails with ENOENT and the Agent SDK
+ *  reports it as a native binary that "failed to launch", blaming musl versus
+ *  glibc. Name the real cause before spawning. */
+function missingWorkingDirectory(cwd: string): Error | undefined {
+	return existsSync(cwd) ? undefined : new Error(`Claude bridge: the working directory ${cwd} no longer exists, so Claude Code cannot start. `
+		+ "Restart this Pi in a directory that exists, or restore the directory.");
+}
+
 function isOneOffSummary(context: Context, options?: SimpleStreamOptions): boolean {
 	return options?.cacheRetention === "none"
 		&& (context.tools?.length ?? 0) === 0
@@ -528,6 +537,8 @@ async function runIsolatedSummary(
 		context = toBridgeContext(context);
 		const promptText = extractIsolatedSummaryPrompt(context.messages);
 		const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
+		const gone = missingWorkingDirectory(cwd);
+		if (gone) throw gone;
 		const compactProviderSettings = loadConfig(cwd, true).provider;
 		const claudeExecutable = compactProviderSettings?.pathToClaudeCodeExecutable;
 		const cliModel = claudeCodeModelId(model, longContextSettings);
@@ -2067,7 +2078,11 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// --- Fresh query ---
 	const spawnCwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
 	let envConfig: ProviderEnv | undefined;
-	try { envConfig = loadConfig(spawnCwd, true).provider?.env; }
+	try {
+		const gone = missingWorkingDirectory(spawnCwd);
+		if (gone) throw gone;
+		envConfig = loadConfig(spawnCwd, true).provider?.env;
+	}
 	catch (error) {
 		stream.push({ type: "error", reason: "error", error: newAssistantOutput(model, "", "error", errorMessage(error)) });
 		markStreamComplete(stream);
