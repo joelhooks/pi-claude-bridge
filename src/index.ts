@@ -651,7 +651,7 @@ interface SyncResult {
  *  rebuild into a new session every time: it is the only way new policy reaches
  *  the wire. But a rebuild re-imports the whole history, which misses the prompt
  *  cache, and most recoveries carry the same policy the session already holds —
- *  Titan's desk paid ~300K cache-write tokens for each of 56 such recoveries in
+ *  one busy desk paid ~300K cache-write tokens for each of 56 such recoveries in
  *  one evening. Recorded only for transcripts this process built, so a session
  *  whose snapshot is unknown (after a restart, say) still rebuilds. */
 const promptSnapshots = new Map<string, string>();
