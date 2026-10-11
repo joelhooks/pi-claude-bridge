@@ -6,7 +6,7 @@
  */
 import { describe, it, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync, statSync, writeFileSync, utimesSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, statSync, writeFileSync, utimesSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { buildSystemPrompt, buildSystemPromptSections } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/system-prompt.js";
 import activate, { __test } from "../src/index.js";
@@ -170,6 +170,54 @@ describe("prompt capture store", () => {
 		await flushPromptCaptures();
 		assert.equal(JSON.parse(readFileSync(file, "utf8")).captures[0].assembledPrompt, "SECOND");
 		assert.equal((statSync(file).mode & 0o777), 0o600);
+	});
+
+	// 2026-10-11: desks with many prompt variants hold 15-40 MB of captures, and
+	// every settled turn rewrote the whole file even when nothing had changed.
+	it("does not rewrite captures that have not changed", async () => {
+		const same = { version: 1, captures: [{ assembledPrompt: "SAME", contextFiles: [], skills: [] }] };
+		const file = join(promptCaptureDir(), "unchanged-sess.json");
+		savePromptCaptures("unchanged-sess", same);
+		await flushPromptCaptures();
+		const old = new Date(Date.now() - 60 * 60 * 1000);
+		utimesSync(file, old, old);
+		savePromptCaptures("unchanged-sess", structuredClone(same));
+		await flushPromptCaptures();
+		assert.equal(statSync(file).mtimeMs, old.getTime(), "an unchanged snapshot was written again");
+		savePromptCaptures("unchanged-sess", { version: 1, captures: [{ assembledPrompt: "CHANGED", contextFiles: [], skills: [] }] });
+		await flushPromptCaptures();
+		assert.notEqual(statSync(file).mtimeMs, old.getTime(), "a changed snapshot must be written");
+		assert.equal(JSON.parse(readFileSync(file, "utf8")).captures[0].assembledPrompt, "CHANGED");
+	});
+
+	it("does not rewrite an unchanged file a previous process left", async () => {
+		const carrier = { version: 1, captures: [{ assembledPrompt: "LEFT", contextFiles: [], skills: [] }] };
+		const file = join(promptCaptureDir(), "left-sess.json");
+		mkdirSync(promptCaptureDir(), { recursive: true });
+		writeFileSync(file, JSON.stringify(carrier), { mode: 0o600 });
+		const old = new Date(Date.now() - 60 * 60 * 1000);
+		utimesSync(file, old, old);
+		savePromptCaptures("left-sess", carrier);
+		await flushPromptCaptures();
+		assert.equal(statSync(file).mtimeMs, old.getTime(), "the first save of a process rewrote an identical file");
+	});
+
+	it("keeps an unchanged file from ageing out, and rewrites one that was removed", async () => {
+		const carrier = { version: 1, captures: [{ assembledPrompt: "KEEP", contextFiles: [], skills: [] }] };
+		const file = join(promptCaptureDir(), "keep-sess.json");
+		savePromptCaptures("keep-sess", carrier);
+		await flushPromptCaptures();
+		const ino = statSync(file).ino;
+		const stale = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000);
+		utimesSync(file, stale, stale);
+		savePromptCaptures("keep-sess", structuredClone(carrier));
+		await flushPromptCaptures();
+		assert.ok(Date.now() - statSync(file).mtimeMs < 60_000, "a days-old unchanged file must be refreshed for the pruner");
+		assert.equal(statSync(file).ino, ino, "refreshed in place, not rewritten");
+		rmSync(file);
+		savePromptCaptures("keep-sess", structuredClone(carrier));
+		await flushPromptCaptures();
+		assert.equal(JSON.parse(readFileSync(file, "utf8")).captures[0].assembledPrompt, "KEEP", "a removed file must be written again");
 	});
 
 	it("flushes an unwritten save when the process exits", () => {
