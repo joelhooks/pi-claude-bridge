@@ -1,5 +1,6 @@
+import { createHash } from "node:crypto";
 import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { chmod, mkdir, readdir, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, readdir, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { PromptCaptureSnapshot } from "./prompt-capture.js";
@@ -25,6 +26,7 @@ export type PromptCaptureCarrier = { version: 1; captures: PromptCaptureSnapshot
 const MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const PRUNE_MARKER = ".last-prune";
+const TOUCH_AFTER_MS = 24 * 60 * 60 * 1000;
 
 export const isPromptCaptureCarrier = (value: unknown): value is PromptCaptureCarrier =>
 	typeof value === "object"
@@ -49,6 +51,38 @@ function capturePath(sessionId: string): string | undefined {
 const pendingWrites = new Map<string, { latest: string; queued: boolean }>();
 let exitFlushArmed = false;
 
+/** Digest of what each file holds, as far as this process knows. A busy desk's
+ *  captures run to tens of MB and most settled turns change nothing, so an
+ *  unchanged snapshot is not written again (2026-10-11: whole-file rewrites of
+ *  15-40 MB per turn). The first save of a process compares with the file on disk. */
+const writtenDigests = new Map<string, string>();
+const digest = (text: string) => createHash("sha256").update(text).digest("hex");
+
+/** An unchanged file still has to outlive age pruning (MAX_AGE_MS), so its mtime is
+ *  refreshed once a day. False when the file is gone and must be written. */
+async function keepUnchanged(path: string): Promise<boolean> {
+	try {
+		const { mtimeMs } = await stat(path);
+		if (Date.now() - mtimeMs > TOUCH_AFTER_MS) await utimes(path, new Date(), new Date());
+		return true;
+	} catch {
+		writtenDigests.delete(path);
+		return false;
+	}
+}
+
+async function onDiskDigest(path: string): Promise<string | undefined> {
+	const known = writtenDigests.get(path);
+	if (known !== undefined) return known;
+	try {
+		const found = digest(await readFile(path, "utf8"));
+		writtenDigests.set(path, found);
+		return found;
+	} catch {
+		return undefined;
+	}
+}
+
 export function savePromptCaptures(sessionId: string | undefined, carrier: PromptCaptureCarrier): boolean {
 	const path = sessionId ? capturePath(sessionId) : undefined;
 	if (!path || carrier.captures.length === 0) return false;
@@ -72,10 +106,13 @@ async function drainWrites(path: string, slot: { latest: string; queued: boolean
 		const text = slot.latest;
 		const tmp = `${path}.${process.pid}.tmp`;
 		try {
+			const next = digest(text);
+			if (await onDiskDigest(path) === next && await keepUnchanged(path)) continue;
 			await mkdir(promptCaptureDir(), { recursive: true, mode: 0o700 });
 			await writeFile(tmp, text, { mode: 0o600 });
 			await chmod(tmp, 0o600);
 			await rename(tmp, path);
+			writtenDigests.set(path, next);
 		} catch {
 			// Best effort, as before: a failed write costs only the restart-wake path.
 		}
@@ -91,6 +128,7 @@ function armExitFlush(): void {
 	process.once("exit", () => {
 		for (const [path, slot] of pendingWrites) {
 			const tmp = `${path}.${process.pid}.exit.tmp`;
+			if (writtenDigests.get(path) === digest(slot.latest)) continue;
 			try {
 				mkdirSync(promptCaptureDir(), { recursive: true, mode: 0o700 });
 				writeFileSync(tmp, slot.latest, { mode: 0o600 });
