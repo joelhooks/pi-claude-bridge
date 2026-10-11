@@ -537,11 +537,14 @@ async function runIsolatedSummary(
 		debug(`compact summary: spawn model=${cliModel} registeredModel=${model.id} effort=${effort ?? "default"} promptLen=${promptText.length}`);
 
 		providerEnvResolver.assertFresh(childEnv);
+		// Pi asks for no retention on one-off summaries. Nothing reads that cache
+		// entry back, and writing one costs 1.25x the input price instead of 1x.
+		const summaryEnv = options?.cacheRetention === "none" ? { ...childEnv, DISABLE_PROMPT_CACHING: "1" } : childEnv;
 		sdkQuery = query({
 			prompt: promptText,
 			options: {
 				cwd,
-				env: childEnv,
+				env: summaryEnv,
 				settings: { autoMemoryEnabled: false },
 				tools: [],
 				strictMcpConfig: true,

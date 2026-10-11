@@ -58,6 +58,18 @@ describe("isolated summary route", () => {
 		assert.equal(argv[argv.indexOf("--effort") + 1], "high", `no --effort high in ${JSON.stringify(argv)}`);
 	});
 
+	// Pi asks for no cache retention on a one-off summary: nothing will read the
+	// entry, and writing it costs 1.25x the input price instead of 1x.
+	it("writes no prompt cache when Pi asks for no retention", async () => {
+		await summarize();
+		assert.equal(JSON.parse(readFileSync(`${argvFile}.env`, "utf8")).DISABLE_PROMPT_CACHING, "1");
+	});
+
+	it("leaves caching on when Pi asks to retain the cache", async () => {
+		await summarize({ cacheRetention: "short" });
+		assert.equal(JSON.parse(readFileSync(`${argvFile}.env`, "utf8")).DISABLE_PROMPT_CACHING, null);
+	});
+
 	it("leaves effort to Claude Code when no thinking level is set", async () => {
 		await summarize();
 		assert.ok(!JSON.parse(readFileSync(argvFile, "utf8")).includes("--effort"));
