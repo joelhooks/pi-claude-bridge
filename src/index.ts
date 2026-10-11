@@ -7,6 +7,7 @@ import type { Base64ImageSource, ContentBlockParam } from "@anthropic-ai/sdk/res
 import { Type } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
 import { createSession, deleteSession, openSession, repairToolPairing } from "cc-session-io";
+import { createHash } from "crypto";
 import { appendFileSync, mkdirSync, realpathSync, statSync } from "fs";
 import { homedir } from "os";
 import { dirname, join } from "path";
@@ -636,6 +637,33 @@ interface SyncResult {
 	preserveSharedSession?: boolean;
 	// The saved-rewrite epoch the synced history reflects.
 	epoch?: string;
+	// The transcript was just built (rebuild) or will be (clean start), so it has
+	// no prompt snapshot yet: the query that follows pins its append prompt.
+	fresh?: boolean;
+}
+
+/** The append prompt each Claude Code session is pinned to.
+ *
+ *  Claude Code writes a `prompt_snapshot` into a session's transcript on its first
+ *  query and serves every later resume from it, ignoring the append prompt a
+ *  resume passes (2.1.294: a session started with codeword ALPHA still answered
+ *  ALPHA on a resume that passed BRAVO). That is why a wake recovery used to
+ *  rebuild into a new session every time: it is the only way new policy reaches
+ *  the wire. But a rebuild re-imports the whole history, which misses the prompt
+ *  cache, and most recoveries carry the same policy the session already holds —
+ *  one busy desk paid ~300K cache-write tokens for each of 56 such recoveries in
+ *  one evening. Recorded only for transcripts this process built, so a session
+ *  whose snapshot is unknown (after a restart, say) still rebuilds. */
+const promptSnapshots = new Map<string, string>();
+const appendDigest = (append: string | undefined): string => createHash("sha256").update(append ?? "").digest("hex");
+
+function notePromptSnapshot(sessionId: string, append: string | undefined): void {
+	promptSnapshots.set(sessionId, appendDigest(append));
+}
+
+/** Whether a recovered wake must rebuild so its verified policy reaches Claude Code. */
+function recoveryNeedsRebuild(session: SessionState, append: string | undefined): boolean {
+	return promptSnapshots.get(session.sessionId) !== appendDigest(append);
 }
 
 // The branch of the Pi session this process serves, set at session_start.
@@ -803,7 +831,7 @@ function syncSharedSession(
 	if (priorMessages.length === 0) {
 		debug(`Case 1: clean start, ${messages.length} total messages`);
 		debug(`syncResult: path=clean-start`);
-		return { sessionId: null, ...(topLevel && epoch !== undefined ? { epoch } : {}) };
+		return { sessionId: null, fresh: true, ...(topLevel && epoch !== undefined ? { epoch } : {}) };
 	}
 	const previousSessionId = sharedSession?.sessionId;
 	const previousCursor = sharedSession?.cursor ?? 0;
@@ -817,6 +845,8 @@ function syncSharedSession(
 	if (preserveId) {
 		// Wipe prior jsonl + companion dir (no-op if nothing to wipe).
 		deleteSession(previousSessionId!, cwd, process.env.CLAUDE_CONFIG_DIR);
+		// Its prompt snapshot goes with it; the next query pins a new one.
+		promptSnapshots.delete(previousSessionId!);
 	}
 	const session = createSession({
 		projectPath: cwd,
@@ -840,7 +870,7 @@ function syncSharedSession(
 	}
 	debugSessionPaths(`${session.sessionId.slice(0, 8)}`, cwd, session.jsonlPath);
 	debug(`syncResult: path=rebuild sessionId=${session.sessionId} priors=${priorMessages.length} ${previousSessionId === undefined ? "first" : preserveId ? "preserved" : "rotated-post-abort"}`);
-	return { sessionId: session.sessionId, ...(topLevel && epoch !== undefined ? { epoch } : {}) };
+	return { sessionId: session.sessionId, fresh: true, ...(topLevel && epoch !== undefined ? { epoch } : {}) };
 }
 
 // Record that Claude Code's transcript now covers Pi's history up to `cursor`.
@@ -906,6 +936,8 @@ export const __test = {
 		piUI = ui;
 	},
 	syncSharedSession,
+	notePromptSnapshot,
+	recoveryNeedsRebuild,
 	turnStart,
 	extractUserPrompt,
 	wakeRecoveryBoundary,
@@ -1949,10 +1981,15 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	const recoveredWake = !isReentrant && wakeRecoveryBoundary.prepare(context.messages);
 	if (recoveredWake && sharedSession) {
 		// Actual SDK/CC resume retains its previous append-system-prompt on reuse.
-		// Recovery has just verified CURRENT policy. Import priors into a new
-		// session so that policy reaches the wire; leave the old saved history
-		// untouched (forceRotate prevents the rebuild's in-place delete/save).
-		sharedSession = { ...sharedSession, needsRebuild: true, forceRotate: true };
+		// Recovery has just verified CURRENT policy. Unless the session's snapshot
+		// already holds exactly that policy, import priors into a new session so
+		// it reaches the wire; leave the old saved history untouched (forceRotate
+		// prevents the rebuild's in-place delete/save). See promptSnapshots.
+		if (recoveryNeedsRebuild(sharedSession, systemPromptAppend)) {
+			sharedSession = { ...sharedSession, needsRebuild: true, forceRotate: true };
+		} else {
+			debug(`provider: wake recovery resumes session ${sharedSession.sessionId.slice(0, 8)}, whose prompt snapshot already holds the verified policy`);
+		}
 	}
 
 	// 2. Fresh child context — constructor already gave us clean Maps and empty
@@ -2193,6 +2230,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 				const cursor = Math.max(context.messages.length, queryCtx.latestCursor, sharedSession?.cursor ?? 0);
 				debug(`provider: query done, session=${sessionId.slice(0, 8)}, cursor=${cursor}`);
 				advanceSharedSession(sessionId, context.messages, cursor, cwd, syncResult.epoch);
+				if (syncResult.fresh && !isReentrant) notePromptSnapshot(sessionId, systemPromptAppend);
 			}
 
 			if (!isReentrant && queryCtx.activeQuery === sdkQuery) {
