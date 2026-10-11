@@ -536,9 +536,14 @@ async function runIsolatedSummary(
 	try {
 		context = toBridgeContext(context);
 		const promptText = extractIsolatedSummaryPrompt(context.messages);
-		const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
-		const gone = missingWorkingDirectory(cwd);
-		if (gone) throw gone;
+		const requestedCwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
+		// A summary reads no files, so a removed working directory need not cost the
+		// compaction: run it from home, with the user-level bridge config.
+		const cwd = missingWorkingDirectory(requestedCwd) ? homedir() : requestedCwd;
+		if (cwd !== requestedCwd) {
+			console.error(`[claude-bridge] cwd ${requestedCwd} no longer exists; running the summary from ${cwd}`);
+			debug(`compact summary: cwd ${requestedCwd} no longer exists, falling back to ${cwd}`);
+		}
 		const compactProviderSettings = loadConfig(cwd, true).provider;
 		const claudeExecutable = compactProviderSettings?.pathToClaudeCodeExecutable;
 		const cliModel = claudeCodeModelId(model, longContextSettings);
