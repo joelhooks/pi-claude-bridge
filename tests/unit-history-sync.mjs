@@ -150,6 +150,48 @@ describe("content-aware session reuse", () => {
 	}));
 });
 
+// 2026-10-10: pi-codex-goal relabels its previous continuation as superseded in
+// Pi's `context` hook on every new continuation. The rewrite is request-local,
+// never saved, so Claude Code's transcript is still the saved conversation. The
+// content check took it for an edit and rebuilt: 333 of 335 goal continuations
+// re-wrote the whole history to the cache within seconds of the last request.
+describe("saved rewrites versus request-local ones", () => {
+	let branch;
+	const entry = (id, type = "message") => ({ id, type });
+	afterEach(() => { __test.resetSharedSession(); __test.setSessionBranch(undefined); });
+
+	it("keeps resuming when only a context hook reshaped an earlier message", () => withCwd((cwd) => {
+		branch = [entry("a"), entry("b"), entry("c")];
+		__test.setSessionBranch(() => branch);
+		const history = [user("continue the goal"), assistant("working"), user("status?")];
+		const first = __test.syncSharedSession(history, cwd, undefined, undefined, TOP);
+		__test.advanceSharedSession(first.sessionId, history, history.length, cwd);
+
+		branch = [...branch, entry("d"), entry("e")];
+		const reshaped = [user("[superseded continuation]"), ...history.slice(1).map(reprojected), assistant("done"), user("next")];
+		const result = __test.syncSharedSession(reshaped, cwd, undefined, undefined, TOP);
+
+		assert.equal(result.sessionId, first.sessionId);
+		assert.match(transcriptText(first.sessionId, cwd), /continue the goal/, "resumed, not rebuilt from the request-local text");
+		assert.equal(__test.sharedPrefixChanged(reshaped), false, "a live query must not be torn down for it either");
+	}));
+
+	it("rebuilds when a saved context_edit lands on the branch", () => withCwd((cwd) => {
+		branch = [entry("a"), entry("b"), entry("c")];
+		__test.setSessionBranch(() => branch);
+		const history = [user("deploy to staging"), assistant("done"), user("status?")];
+		const first = __test.syncSharedSession(history, cwd, undefined, undefined, TOP);
+		__test.advanceSharedSession(first.sessionId, history, history.length, cwd);
+
+		branch = [...branch, entry("edit-1", "context_edit"), entry("d")];
+		const edited = [user("deploy to the canary only"), ...history.slice(1), assistant("ok"), user("go")];
+		assert.equal(__test.sharedPrefixChanged(edited), true);
+		const result = __test.syncSharedSession(edited, cwd, undefined, undefined, TOP);
+		assert.equal(result.sessionId, first.sessionId);
+		assert.match(transcriptText(first.sessionId, cwd), /deploy to the canary only/);
+	}));
+});
+
 describe("flowing-view boundary signal", () => {
 	afterEach(() => {
 		__test.resetSharedSession();
