@@ -55,6 +55,28 @@ describe("cache health", () => {
 		assert.equal(readFileSync(join(f.state, "alerts.jsonl"), "utf8").trim().split("\n").length, 1);
 	});
 
+	it("times gaps from the last request that reached Claude, and names wake recovery as the trigger", () => {
+		const f = fixture();
+		const parked = (minutes) => JSON.stringify({ type: "message", timestamp: at(minutes),
+			message: { role: "assistant", provider: "claude-bridge", model: "claude-opus-5-5", content: [], stopReason: "stop",
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } } });
+		const recovery = (minutes) => JSON.stringify({ type: "message", timestamp: at(minutes),
+			message: { role: "user", content: "[claude-bridge] A delayed message above (timer, watch or intercom) arrived early." } });
+		const note = (minutes) => JSON.stringify({ type: "custom_message", customType: "muster-owner-note", timestamp: at(minutes) });
+		writeFileSync(f.file, [
+			reply(0, { read: 0, write: 200_000 }),
+			// Eight idle minutes: the cache expired, whatever the parked wake suggests.
+			parked(8), recovery(8.01), note(8.02), reply(8.1, { read: 40_000, write: 200_000 }),
+			// One minute later: a real rebuild, caused by the recovery.
+			parked(9), recovery(9.01), note(9.02), reply(9.1, { read: 40_000, write: 200_000 }),
+		].join("\n") + "\n");
+		scan({ sessions: join(f.root, "sessions"), state: f.state, threshold: 10, host: "test", now: NOW });
+		const events = readFileSync(join(f.state, "events-2026-10.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+		assert.equal(events.length, 3, "a parked wake is not a request");
+		assert.deepEqual(events.map((e) => e.full), [false, false, true]);
+		assert.equal(events[2].trigger, "wake-recovery");
+	});
+
 	it("counts a forked session's copied history once", () => {
 		const f = fixture();
 		const history = [reply(0, { read: 0, write: 200_000 }), reply(1, { read: 199_000, write: 2_000 })];
