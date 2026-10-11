@@ -6,9 +6,9 @@ import { query, type EffortLevel, type HookCallback, type SDKMessage, type Setti
 import type { Base64ImageSource, ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { Type } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
-import { createSession, deleteSession, openSession, repairToolPairing } from "cc-session-io";
+import { createSession, deleteSession, getSessionPath, openSession, repairToolPairing } from "cc-session-io";
 import { createHash } from "crypto";
-import { appendFileSync, mkdirSync, realpathSync, statSync } from "fs";
+import { appendFileSync, mkdirSync, readFileSync, realpathSync, statSync } from "fs";
 import { homedir } from "os";
 import { dirname, join } from "path";
 import { PROVIDER_ID, messageContentToText, convertPiMessages } from "./convert.js";
@@ -268,6 +268,11 @@ interface SessionState {
 	// Saved history rewrites (context_edit and compaction entries) on Pi's branch
 	// when this session was built or advanced; see persistedRewriteEpoch.
 	epoch?: string;
+	// uuid of the last assistant record Claude Code wrote to this transcript.
+	tail?: string;
+	// Another process's transcript, adopted at startup (see adoptPersistedSession).
+	// Resumes fork it into a session of our own, and a rebuild never deletes it.
+	fork?: boolean;
 }
 
 /**
@@ -643,6 +648,8 @@ interface SyncResult {
 	// The transcript was just built (rebuild) or will be (clean start), so it has
 	// no prompt snapshot yet: the query that follows pins its append prompt.
 	fresh?: boolean;
+	// Resume forked: the transcript belongs to another process (SessionState.fork).
+	fork?: boolean;
 }
 
 /** The append prompt each Claude Code session is pinned to.
@@ -670,7 +677,7 @@ function recoveryNeedsRebuild(session: SessionState, append: string | undefined)
 }
 
 // The branch of the Pi session this process serves, set at session_start.
-let sessionBranchSource: (() => ReadonlyArray<{ id: string; type: string }>) | undefined;
+let sessionBranchSource: (() => ReadonlyArray<{ id: string; type: string; customType?: string; data?: unknown }>) | undefined;
 
 // Identifies the saved history rewrites on Pi's branch: context_edit and
 // compaction entries. Pi's context hook can also reshape messages for one
@@ -683,6 +690,128 @@ function persistedRewriteEpoch(): string | undefined {
 	if (!branch) return undefined;
 	return branch.filter((entry) => entry.type === "context_edit" || entry.type === "compaction")
 		.map((entry) => entry.id).join(",");
+}
+
+// --- Warm restart ---
+//
+// A new Pi process (a restart, `pi --fork`, `--session-id`) starts with no
+// shared session, and rebuilding one imports Pi's whole history into a fresh
+// transcript. Those bytes are not the ones the previous process sent, so the
+// first request misses the prompt cache past the system prompt: on a long
+// session, a cache write of hundreds of thousands of tokens per restart.
+//
+// Instead, each process records which transcript holds Pi's history so far, as
+// a non-context entry in Pi's own session. The next process resumes that
+// transcript, forked so that two processes never write one file. The pointer
+// lives on Pi's branch, so a fork or a tree navigation carries exactly the
+// pointers that apply to the history it holds.
+
+const SESSION_POINTER_TYPE = "claude-bridge-session";
+
+interface SessionPointer {
+	v: 1;
+	sessionId: string;
+	cursor: number;
+	prefix: string;
+	// Digest of the append prompt pinned in the transcript's prompt_snapshot.
+	appendDigest: string;
+	// Last assistant record of the turn the pointer covers; see adoptionRefusal.
+	tail: string;
+	epoch?: string;
+}
+
+// Pi's appendEntry for this session, set at session_start.
+let appendSessionEntry: ((customType: string, data: SessionPointer) => void) | undefined;
+// The pointer last written or read, so an unchanged session writes nothing.
+let persistedPointerKey: string | undefined;
+
+function isSessionPointer(data: unknown): data is SessionPointer {
+	const p = data as Partial<SessionPointer> | undefined;
+	return p?.v === 1 && typeof p.sessionId === "string" && typeof p.cursor === "number"
+		&& typeof p.prefix === "string" && typeof p.appendDigest === "string" && typeof p.tail === "string"
+		&& (p.epoch === undefined || typeof p.epoch === "string");
+}
+
+function latestSessionPointer(): SessionPointer | undefined {
+	const branch = sessionBranchSource?.() ?? [];
+	for (let i = branch.length - 1; i >= 0; i--) {
+		const entry = branch[i];
+		if (entry.type === "custom" && entry.customType === SESSION_POINTER_TYPE && isSessionPointer(entry.data)) return entry.data;
+	}
+	return undefined;
+}
+
+/** Record the shared session in Pi's session, when it moved since last time.
+ *  Only a session this process owns and whose prompt snapshot it knows: a
+ *  pointer without the snapshot digest could never be adopted. */
+function persistSharedSession(): void {
+	const s = sharedSession;
+	if (!s || !appendSessionEntry || s.needsRebuild || s.fork) return;
+	const snapshot = promptSnapshots.get(s.sessionId);
+	if (s.prefix === undefined || s.tail === undefined || snapshot === undefined) return;
+	const pointer: SessionPointer = {
+		v: 1, sessionId: s.sessionId, cursor: s.cursor, prefix: s.prefix, appendDigest: snapshot, tail: s.tail,
+		...(s.epoch === undefined ? {} : { epoch: s.epoch }),
+	};
+	const key = JSON.stringify(pointer);
+	if (key === persistedPointerKey) return;
+	appendSessionEntry(SESSION_POINTER_TYPE, pointer);
+	persistedPointerKey = key;
+	debug(`warm restart: recorded session ${s.sessionId.slice(0, 8)} cursor=${s.cursor}`);
+}
+
+/** Why `pointer` cannot be resumed for this history, or undefined if it can. */
+function adoptionRefusal(pointer: SessionPointer, priorMessages: Context["messages"], cwd: string, epoch: string | undefined, append: string | undefined): string | undefined {
+	if (priorMessages.length < pointer.cursor) return `history is shorter than the pointer (${priorMessages.length} < ${pointer.cursor})`;
+	if (prefixDigest(priorMessages, pointer.cursor) !== pointer.prefix) return "history no longer starts with what the transcript holds";
+	if (pointer.epoch !== undefined && epoch !== pointer.epoch) return "a saved rewrite since the pointer";
+	// A resume keeps the transcript's prompt snapshot and ignores the append it
+	// passes, so different policy can only reach Claude Code through a rebuild.
+	if (appendDigest(append) !== pointer.appendDigest) return "the append prompt changed";
+	// The same allowance as REUSE: the final assistant message Pi appends after
+	// the stream ends is already in the transcript. Anything more needs a rebuild.
+	const missed = priorMessages.slice(pointer.cursor);
+	if (missed.length > 1 || (missed.length === 1 && (missed[0] as { role?: string }).role !== "assistant")) {
+		return `${missed.length} message(s) past the pointer`;
+	}
+	let text: string;
+	try {
+		text = readFileSync(getSessionPath(pointer.sessionId, cwd, process.env.CLAUDE_CONFIG_DIR), "utf8");
+	} catch {
+		return "transcript is gone";
+	}
+	// The pointer is written when a turn ends. A process that died later, mid-
+	// turn, can have left a prompt or tool result after that turn's last assistant
+	// record; a fork would carry it into a history Pi does not have.
+	const lines = text.split("\n").filter(Boolean);
+	let tailAt = -1;
+	for (let i = 0; i < lines.length; i++) {
+		let record: { type?: string; uuid?: string };
+		try { record = JSON.parse(lines[i]); } catch { return "transcript has an unreadable record"; }
+		if (record.uuid === pointer.tail) tailAt = i;
+		else if (tailAt >= 0 && record.type === "user") return "transcript continued past the pointer";
+	}
+	if (tailAt < 0) return "transcript does not hold the pointer's last turn";
+	return undefined;
+}
+
+/** Take over the transcript the previous process recorded, when it still holds
+ *  exactly the start of Pi's history. Leaves sharedSession null otherwise, and
+ *  the caller rebuilds as it always has. */
+function adoptPersistedSession(priorMessages: Context["messages"], cwd: string, epoch: string | undefined, append: string | undefined): void {
+	const pointer = latestSessionPointer();
+	if (!pointer) return;
+	persistedPointerKey = JSON.stringify(pointer);
+	const refusal = adoptionRefusal(pointer, priorMessages, cwd, epoch, append);
+	if (refusal) {
+		debug(`warm restart: rebuilding instead of resuming ${pointer.sessionId.slice(0, 8)}: ${refusal}`);
+		return;
+	}
+	sharedSession = {
+		sessionId: pointer.sessionId, cursor: pointer.cursor, cwd, prefix: pointer.prefix, tail: pointer.tail, fork: true,
+		...(pointer.epoch === undefined ? {} : { epoch: pointer.epoch }),
+	};
+	debug(`warm restart: adopting session ${pointer.sessionId.slice(0, 8)} cursor=${pointer.cursor}, resuming forked`);
 }
 
 /**
@@ -766,7 +895,7 @@ function syncSharedSession(
 	cwd: string,
 	customToolNameToSdk?: Map<string, string>,
 	modelId?: string,
-	{ topLevel = false }: { topLevel?: boolean } = {},
+	{ topLevel = false, adopt }: { topLevel?: boolean; adopt?: { append: string | undefined } } = {},
 ): SyncResult {
 	const history = nonSystemMessages(messages);
 	const priorMessages = history.slice(0, turnStart(history)); // everything before the current user turn
@@ -786,6 +915,8 @@ function syncSharedSession(
 	// transcript misses Claude Code's prompt cache. Nested queries keep the
 	// content check; a mismatch there only buys a clean start.
 	const epoch = persistedRewriteEpoch();
+	// A process with no session of its own yet may resume the previous one's.
+	if (topLevel && adopt && sharedSession === null) adoptPersistedSession(priorMessages, cwd, epoch, adopt.append);
 	const byEpoch = topLevel && epoch !== undefined && sharedSession?.epoch !== undefined;
 	const continues = sharedSession !== null && !sharedSession.needsRebuild
 		&& priorMessages.length >= sharedSession.cursor
@@ -803,7 +934,7 @@ function syncSharedSession(
 			}
 			debug(`Case 3: ${trailingAssistantOnly ? "advanced cursor past trailing assistant, " : ""}resuming session ${sharedSession.sessionId.slice(0, 8)}, cursor=${sharedSession.cursor}`);
 			debug(`syncResult: path=reuse sessionId=${sharedSession.sessionId} cursor=${sharedSession.cursor}`);
-			return { sessionId: sharedSession.sessionId, ...(topLevel && epoch !== undefined ? { epoch } : {}) };
+			return { sessionId: sharedSession.sessionId, ...(sharedSession.fork ? { fork: true } : {}), ...(topLevel && epoch !== undefined ? { epoch } : {}) };
 		}
 	}
 	// This is what keeps a reentrant subagent from taking over the parent's
@@ -842,7 +973,8 @@ function syncSharedSession(
 	// existing UUID), so prompt-cache UUIDs stay stable for log correlation
 	// and for any tools that key off them. Skipped only when there's a
 	// concurrent writer we shouldn't race — see forceRotate docs above.
-	const preserveId = previousSessionId !== undefined && !sharedSession?.forceRotate;
+	// Never for an adopted session: that transcript is another process's.
+	const preserveId = previousSessionId !== undefined && !sharedSession?.forceRotate && !sharedSession?.fork;
 	// Before deleteSession — it wipes the file these live in.
 	const carried = previousSessionId !== undefined ? readCarriedAttachments(previousSessionId, cwd) : [];
 	if (preserveId) {
@@ -880,7 +1012,8 @@ function syncSharedSession(
 // Keeps the digest when the cursor has not moved (a tool-result delivery already
 // recorded it); otherwise digests the history in hand, or drops back to the
 // count-only check when the cursor reaches past it.
-function advanceSharedSession(sessionId: string, messages: Context["messages"], cursor: number, cwd: string, syncedEpoch?: string): void {
+function advanceSharedSession(sessionId: string, messages: Context["messages"], cursor: number, cwd: string, syncedEpoch?: string, tail?: string): void {
+	const same = sharedSession?.sessionId === sessionId;
 	const prefix = sharedSession?.sessionId === sessionId && sharedSession.cursor === cursor
 		? sharedSession.prefix
 		: prefixDigest(nonSystemMessages(messages), cursor);
@@ -889,7 +1022,14 @@ function advanceSharedSession(sessionId: string, messages: Context["messages"], 
 	const epoch = sharedSession?.sessionId === sessionId && sharedSession.epoch !== undefined
 		? sharedSession.epoch
 		: syncedEpoch ?? (sharedSession === null ? persistedRewriteEpoch() : undefined);
-	sharedSession = { sessionId, cursor, cwd, ...(prefix === undefined ? {} : { prefix }), ...(epoch === undefined ? {} : { epoch }) };
+	// A query that wrote no assistant record leaves the last one as the tail.
+	const lastAssistant = tail ?? (same ? sharedSession?.tail : undefined);
+	// Still another process's transcript if the fork's own id never arrived.
+	const fork = same && sharedSession?.fork;
+	sharedSession = {
+		sessionId, cursor, cwd, ...(prefix === undefined ? {} : { prefix }), ...(epoch === undefined ? {} : { epoch }),
+		...(lastAssistant === undefined ? {} : { tail: lastAssistant }), ...(fork ? { fork } : {}),
+	};
 }
 
 /** Whether Pi's history no longer starts with what the shared session holds:
@@ -940,6 +1080,12 @@ export const __test = {
 	},
 	syncSharedSession,
 	notePromptSnapshot,
+	persistSharedSession,
+	setAppendSessionEntry(sink: typeof appendSessionEntry) {
+		appendSessionEntry = sink;
+		persistedPointerKey = undefined;
+	},
+	SESSION_POINTER_TYPE,
 	recoveryNeedsRebuild,
 	turnStart,
 	extractUserPrompt,
@@ -1595,8 +1741,9 @@ async function consumeQuery(
 	model: Model<any>,
 	wasAborted: () => boolean,
 	queryCtx: QueryContext,
-): Promise<{ capturedSessionId?: string }> {
+): Promise<{ capturedSessionId?: string; lastAssistantUuid?: string }> {
 	let capturedSessionId: string | undefined;
+	let lastAssistantUuid: string | undefined;
 
 	for await (const message of sdkQuery) {
 		if (RECORD_STREAM_PATH) appendFileSync(RECORD_STREAM_PATH, `${JSON.stringify(message)}\n`);
@@ -1664,6 +1811,9 @@ async function consumeQuery(
 			}
 			continue;
 		}
+		// The transcript's newest assistant record, for the warm-restart pointer.
+		// Taken whether or not a Pi stream is waiting: the record is written either way.
+		if (message.type === "assistant" && message.parent_tool_use_id === null && message.uuid) lastAssistantUuid = message.uuid;
 		if (!queryCtx.currentPiStream || !queryCtx.turnOutput) continue;
 
 		switch (message.type) {
@@ -1710,7 +1860,7 @@ async function consumeQuery(
 	// DEBUG: trace when consumeQuery exits
 	debug(`consumeQuery: for-await loop exited, wasAborted=${wasAborted()}, capturedSessionId=${capturedSessionId?.slice(0, 8) ?? "none"}`);
 
-	return { capturedSessionId };
+	return { capturedSessionId, lastAssistantUuid };
 }
 
 /** The trailing user turn as content blocks, or null if there isn't one.
@@ -2014,7 +2164,8 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// Only the conversation this Pi session is having may rebuild the shared
 	// session from a rewritten history. Nested queries and other sessions' agents
 	// get a clean start instead (see syncSharedSession).
-	const syncResult = syncSharedSession(context.messages, cwd, customToolNameToSdk, cliModel, { topLevel: !isReentrant && isOwnPiSession(options) });
+	const topLevel = !isReentrant && isOwnPiSession(options);
+	const syncResult = syncSharedSession(context.messages, cwd, customToolNameToSdk, cliModel, { topLevel, ...(topLevel ? { adopt: { append: systemPromptAppend } } : {}) });
 	const { sessionId: resumeSessionId } = syncResult;
 	const promptBlocks = extractUserPromptBlocks(context.messages);
 	let promptText = extractUserPrompt(context.messages) ?? "";
@@ -2154,13 +2305,16 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		...(mcpServers ? { mcpServers } : {}),
 		...(toolListingHooks ? { hooks: toolListingHooks } : {}),
 		...(resumeSessionId ? { resume: resumeSessionId } : {}),
+		// Claude Code copies the transcript to a new id (reported in system/init)
+		// and leaves the original, and its prompt snapshot, untouched.
+		...(resumeSessionId && syncResult.fork ? { forkSession: true } : {}),
 		...(claudeExecutable ? { pathToClaudeCodeExecutable: claudeExecutable } : {}),
 		...makeCliDebugOptions("provider", envConfig !== undefined),
 	};
 
 	debug("provider: fresh query",
 		`model=${cliModel} msgs=${context.messages.length} tools=${mcpTools.length}`,
-		`resume=${resumeSessionId?.slice(0, 8) ?? "none"} effort=${effort ?? "default"}`,
+		`resume=${resumeSessionId?.slice(0, 8) ?? "none"}${syncResult.fork ? " (fork)" : ""} effort=${effort ?? "default"}`,
 		`mode=${resumeInterruptedTurn ? "interrupted-turn" : "prompt"}`,
 		`ctxFiles=${promptCapture?.contextFiles.length ?? 0} strictMcp=${strictMcpConfigEnabled}`,
 		`prompt=${promptText.slice(0, 60)}${promptBlocks ? " [+images]" : ""}`);
@@ -2202,7 +2356,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 
 	// Background consumer — runs until query ends
 	const done = consumeQuery(sdkQuery, customToolNameToPi, model, () => wasAborted, queryCtx)
-		.then(async ({ capturedSessionId }) => {
+		.then(async ({ capturedSessionId, lastAssistantUuid }) => {
 			debug(`provider: consumeQuery completed, stopReason=${queryCtx.turnOutput?.stopReason}, error=${queryCtx.turnOutput?.errorMessage}, aborted=${wasAborted}`);
 
 			// --- Abort detection in normal completion path ---
@@ -2232,8 +2386,10 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			} else if (sessionId) {
 				const cursor = Math.max(context.messages.length, queryCtx.latestCursor, sharedSession?.cursor ?? 0);
 				debug(`provider: query done, session=${sessionId.slice(0, 8)}, cursor=${cursor}`);
-				advanceSharedSession(sessionId, context.messages, cursor, cwd, syncResult.epoch);
-				if (syncResult.fresh && !isReentrant) notePromptSnapshot(sessionId, systemPromptAppend);
+				advanceSharedSession(sessionId, context.messages, cursor, cwd, syncResult.epoch, lastAssistantUuid);
+				// A fork inherits its parent's snapshot, which adoption checked
+				// against this very append (adoptionRefusal).
+				if ((syncResult.fresh || syncResult.fork) && !isReentrant) notePromptSnapshot(sessionId, systemPromptAppend);
 			}
 
 			if (!isReentrant && queryCtx.activeQuery === sdkQuery) {
@@ -2425,11 +2581,14 @@ async function promptAndWait(
 	// Note: doesn't update sharedSession.cursor after completion, so the next
 	// provider call will see missed messages and trigger a Case 4 rebuild.
 	let resumeSessionId: string | null = null;
+	let forkResume = false;
 	if (!options?.isolated && options?.context?.length) {
 		if (sharedSession) {
 			// Provider already has a session — just resume from it
 			// Any missed messages from other providers were already handled by the provider's Case 4
 			resumeSessionId = sharedSession.sessionId;
+			// Another process's transcript: never write into it.
+			forkResume = sharedSession.fork === true;
 		} else {
 			// No provider session yet — create one from pi's context
 			const contextWithPrompt = [...options.context, { role: "user" as const, content: prompt, timestamp: Date.now() }];
@@ -2499,6 +2658,7 @@ async function promptAndWait(
 			settingSources: ["user", "project"] as SettingSource[],
 			extraArgs,
 			...(resumeSessionId ? { resume: resumeSessionId } : {}),
+			...(resumeSessionId && forkResume ? { forkSession: true } : {}),
 			...(options?.isolated ? { persistSession: false } : {}),
 			...(claudeExecutable ? { pathToClaudeCodeExecutable: claudeExecutable } : {}),
 			...makeCliDebugOptions("askclaude", envConfig !== undefined),
@@ -2634,6 +2794,7 @@ export default function (pi: ExtensionAPI) {
 	const clearSession = (event: string) => {
 		debug(`${event}: clearing session ${sharedSession?.sessionId?.slice(0, 8) ?? "none"}`);
 		sharedSession = null;
+		persistedPointerKey = undefined;
 		promptCaptures.clear();
 		promptCompositionError = undefined;
 		lastSystemPromptOptions = undefined;
@@ -2661,6 +2822,7 @@ export default function (pi: ExtensionAPI) {
 		captureSessionId = ctx?.sessionManager?.getSessionId?.();
 		sessionBranch = () => ctx.sessionManager.getBranch();
 		sessionBranchSource = typeof ctx?.sessionManager?.getBranch === "function" ? () => ctx.sessionManager.getBranch() : undefined;
+		appendSessionEntry = typeof pi.appendEntry === "function" ? (customType, data) => pi.appendEntry(customType, data) : undefined;
 		const globals = promptCaptureReloadGlobals();
 		if (event.reason === "reload") {
 			const carrier = globals[PROMPT_CAPTURE_RELOAD_KEY];
@@ -2851,6 +3013,8 @@ export default function (pi: ExtensionAPI) {
 	pi.on("agent_end", () => {
 		lastSystemPromptOptions = undefined;
 		persistPromptCaptures("agent_end");
+		// Once per run, at a turn boundary: the next process resumes from here.
+		persistSharedSession();
 	});
 	// Pi defers prompts submitted during agent_settled until the run has fully
 	// finished. The recovery is a user turn, so it cannot itself be recovered: a
@@ -2879,6 +3043,7 @@ export default function (pi: ExtensionAPI) {
 		compactionClaims.clear();
 		sessionBranch = undefined;
 		sessionBranchSource = undefined;
+		appendSessionEntry = undefined;
 	});
 
 	pi.on("session_before_compact", async (event, ctx) => {
