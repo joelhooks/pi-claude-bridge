@@ -1088,6 +1088,9 @@ export const __test = {
 	setSharedSession(state: SessionState | null) {
 		sharedSession = state;
 	},
+	setProviderSettings(settings: NonNullable<Config["provider"]>) {
+		providerSettings = settings;
+	},
 	getSharedSession() {
 		return sharedSession;
 	},
@@ -2050,11 +2053,15 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		return stream;
 	}
 
-	// A tool result with no live query to take it is either an orphan (below) or
-	// the turn pi compacted underneath us, whose query the session_compact
-	// handler already tore down. Consumed here whatever the outcome: a stale flag
-	// must not turn a later orphan into a query.
-	const continuation = lastMsgRole === "toolResult" ? midTurnContinuation : null;
+	// A tool result with no live query to take it is an orphan (below), the turn
+	// pi compacted underneath us, whose query the session_compact handler already
+	// tore down, or the result of another provider's tool call: the model was
+	// switched to this one while that tool ran, and the turn is ours to finish.
+	// The flag is consumed here whatever the outcome: a stale one must not turn a
+	// later orphan into a query.
+	const continuation = lastMsgRole === "toolResult"
+		? midTurnContinuation ?? (endsOnForeignToolCall(context.messages) ? "provider-switch" : null)
+		: null;
 	midTurnContinuation = null;
 
 	// --- Orphaned tool result (e.g. user aborted a tool call) ---
@@ -2541,6 +2548,17 @@ async function waitForToolListing(listed: Promise<void>, isConnected: () => Prom
  *  resume looks for. convertPiMessages drops an assistant message with no content
  *  at all (an aborted turn), and a result behind one of those would be repaired
  *  into nothing CC can continue. */
+/** Whether the trailing tool results answer a tool call another provider made.
+ *  Ending that turn as an orphan would stop the agent mid-task with an empty
+ *  reply (2026-10-11: a worker switched from a Codex model kept its uncommitted
+ *  work idle for 20 minutes). */
+function endsOnForeignToolCall(messages: Context["messages"]): boolean {
+	if (!hasRebuildableToolTail(messages)) return false;
+	let i = messages.length - 1;
+	while (messages[i].role !== "assistant") i--;
+	return (messages[i] as { provider?: string }).provider !== PROVIDER_ID;
+}
+
 function hasRebuildableToolTail(messages: Context["messages"]): boolean {
 	let i = messages.length - 1;
 	if (i < 0 || messages[i].role !== "toolResult") return false;
