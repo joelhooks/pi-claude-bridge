@@ -264,6 +264,9 @@ interface SessionState {
 	// from (history-digest.ts). Absent when that history was not in hand, which
 	// falls back to the count-only check.
 	prefix?: string;
+	// Saved history rewrites (context_edit and compaction entries) on Pi's branch
+	// when this session was built or advanced; see persistedRewriteEpoch.
+	epoch?: string;
 }
 
 /**
@@ -631,6 +634,24 @@ function reinjectPriorCompactionFileOps(branchEntries: Array<{ type: string; det
 interface SyncResult {
 	sessionId: string | null;
 	preserveSharedSession?: boolean;
+	// The saved-rewrite epoch the synced history reflects.
+	epoch?: string;
+}
+
+// The branch of the Pi session this process serves, set at session_start.
+let sessionBranchSource: (() => ReadonlyArray<{ id: string; type: string }>) | undefined;
+
+// Identifies the saved history rewrites on Pi's branch: context_edit and
+// compaction entries. Pi's context hook can also reshape messages for one
+// request (pi-codex-goal relabels superseded continuations on every turn);
+// those are never saved, and Claude Code's transcript is still the saved
+// conversation, so they must not cost a rebuild. Undefined when the branch is
+// not known (tests, other module instances): callers fall back to content.
+function persistedRewriteEpoch(): string | undefined {
+	const branch = sessionBranchSource?.();
+	if (!branch) return undefined;
+	return branch.filter((entry) => entry.type === "context_edit" || entry.type === "compaction")
+		.map((entry) => entry.id).join(",");
 }
 
 /**
@@ -728,9 +749,17 @@ function syncSharedSession(
 	// pi-side history rewrites such as /compact and session_tree: without it,
 	// missed = [].slice(cursor) can falsely hit REUSE and resume an unrelated
 	// longer CC session. See issue #25.
+	//
+	// The top-level conversation compares saved rewrites, not content: a request-
+	// local context-hook rewrite would otherwise force a rebuild, and a rebuilt
+	// transcript misses Claude Code's prompt cache. Nested queries keep the
+	// content check; a mismatch there only buys a clean start.
+	const epoch = persistedRewriteEpoch();
+	const byEpoch = topLevel && epoch !== undefined && sharedSession?.epoch !== undefined;
 	const continues = sharedSession !== null && !sharedSession.needsRebuild
 		&& priorMessages.length >= sharedSession.cursor
-		&& (sharedSession.prefix === undefined || prefixDigest(priorMessages, sharedSession.cursor) === sharedSession.prefix);
+		&& (byEpoch ? epoch === sharedSession.epoch
+			: sharedSession.prefix === undefined || prefixDigest(priorMessages, sharedSession.cursor) === sharedSession.prefix);
 
 	// REUSE path
 	if (sharedSession && continues) {
@@ -739,11 +768,11 @@ function syncSharedSession(
 			missed.length === 1 && (missed[0] as { role?: string }).role === "assistant";
 		if (missed.length === 0 || trailingAssistantOnly) {
 			if (trailingAssistantOnly) {
-				sharedSession = { ...sharedSession, cursor: priorMessages.length, cwd, prefix: prefixDigest(priorMessages, priorMessages.length) };
+				sharedSession = { ...sharedSession, cursor: priorMessages.length, cwd, prefix: prefixDigest(priorMessages, priorMessages.length), ...(topLevel && epoch !== undefined ? { epoch } : {}) };
 			}
 			debug(`Case 3: ${trailingAssistantOnly ? "advanced cursor past trailing assistant, " : ""}resuming session ${sharedSession.sessionId.slice(0, 8)}, cursor=${sharedSession.cursor}`);
 			debug(`syncResult: path=reuse sessionId=${sharedSession.sessionId} cursor=${sharedSession.cursor}`);
-			return { sessionId: sharedSession.sessionId };
+			return { sessionId: sharedSession.sessionId, ...(topLevel && epoch !== undefined ? { epoch } : {}) };
 		}
 	}
 	// This is what keeps a reentrant subagent from taking over the parent's
@@ -774,7 +803,7 @@ function syncSharedSession(
 	if (priorMessages.length === 0) {
 		debug(`Case 1: clean start, ${messages.length} total messages`);
 		debug(`syncResult: path=clean-start`);
-		return { sessionId: null };
+		return { sessionId: null, ...(topLevel && epoch !== undefined ? { epoch } : {}) };
 	}
 	const previousSessionId = sharedSession?.sessionId;
 	const previousCursor = sharedSession?.cursor ?? 0;
@@ -800,7 +829,7 @@ function syncSharedSession(
 	// records, not messages: `messages` filters out the attachment records that
 	// carrying an `@file` expansion across a rebuild writes into the same file.
 	verifyWrittenSession(session.jsonlPath, session.sessionId, session.records.length, cwd);
-	sharedSession = { sessionId: session.sessionId, cursor: priorMessages.length, cwd, prefix: prefixDigest(priorMessages, priorMessages.length) };
+	sharedSession = { sessionId: session.sessionId, cursor: priorMessages.length, cwd, prefix: prefixDigest(priorMessages, priorMessages.length), ...(topLevel && epoch !== undefined ? { epoch } : {}) };
 	if (previousSessionId === undefined) {
 		debug(`Case 2: first turn with ${priorMessages.length} prior messages → session ${session.sessionId.slice(0, 8)}, ${session.records.length} records`);
 	} else if (preserveId) {
@@ -811,24 +840,32 @@ function syncSharedSession(
 	}
 	debugSessionPaths(`${session.sessionId.slice(0, 8)}`, cwd, session.jsonlPath);
 	debug(`syncResult: path=rebuild sessionId=${session.sessionId} priors=${priorMessages.length} ${previousSessionId === undefined ? "first" : preserveId ? "preserved" : "rotated-post-abort"}`);
-	return { sessionId: session.sessionId };
+	return { sessionId: session.sessionId, ...(topLevel && epoch !== undefined ? { epoch } : {}) };
 }
 
 // Record that Claude Code's transcript now covers Pi's history up to `cursor`.
 // Keeps the digest when the cursor has not moved (a tool-result delivery already
 // recorded it); otherwise digests the history in hand, or drops back to the
 // count-only check when the cursor reaches past it.
-function advanceSharedSession(sessionId: string, messages: Context["messages"], cursor: number, cwd: string): void {
+function advanceSharedSession(sessionId: string, messages: Context["messages"], cursor: number, cwd: string, syncedEpoch?: string): void {
 	const prefix = sharedSession?.sessionId === sessionId && sharedSession.cursor === cursor
 		? sharedSession.prefix
 		: prefixDigest(nonSystemMessages(messages), cursor);
-	sharedSession = { sessionId, cursor, cwd, ...(prefix === undefined ? {} : { prefix }) };
+	// The epoch the transcript reflects: what a tool-result delivery or the sync
+	// recorded, never the branch now, which may hold a rewrite made mid-turn.
+	const epoch = sharedSession?.sessionId === sessionId && sharedSession.epoch !== undefined
+		? sharedSession.epoch
+		: syncedEpoch ?? (sharedSession === null ? persistedRewriteEpoch() : undefined);
+	sharedSession = { sessionId, cursor, cwd, ...(prefix === undefined ? {} : { prefix }), ...(epoch === undefined ? {} : { epoch }) };
 }
 
 /** Whether Pi's history no longer starts with what the shared session holds:
  *  something rewrote or shortened it since the session was built or advanced. */
 function sharedPrefixChanged(messages: Context["messages"]): boolean {
-	if (!sharedSession || sharedSession.prefix === undefined) return false;
+	if (!sharedSession) return false;
+	const epoch = persistedRewriteEpoch();
+	if (epoch !== undefined && sharedSession.epoch !== undefined) return epoch !== sharedSession.epoch;
+	if (sharedSession.prefix === undefined) return false;
 	return prefixDigest(nonSystemMessages(messages), sharedSession.cursor) !== sharedSession.prefix;
 }
 
@@ -851,6 +888,9 @@ export const __test = {
 	},
 	advanceSharedSession,
 	sharedPrefixChanged,
+	setSessionBranch(source: typeof sessionBranchSource) {
+		sessionBranchSource = source;
+	},
 	consumeMidTurnContinuation() {
 		const label = midTurnContinuation;
 		midTurnContinuation = null;
@@ -1801,6 +1841,8 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		if (sharedSession && resultCtx === ctx()) {
 			sharedSession.cursor = context.messages.length;
 			sharedSession.prefix = prefixDigest(context.messages, context.messages.length);
+			const epoch = persistedRewriteEpoch();
+			if (epoch !== undefined) sharedSession.epoch = epoch;
 		}
 		resultCtx.latestCursor = Math.max(resultCtx.latestCursor, context.messages.length);
 		return stream;
@@ -2150,7 +2192,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			} else if (sessionId) {
 				const cursor = Math.max(context.messages.length, queryCtx.latestCursor, sharedSession?.cursor ?? 0);
 				debug(`provider: query done, session=${sessionId.slice(0, 8)}, cursor=${cursor}`);
-				advanceSharedSession(sessionId, context.messages, cursor, cwd);
+				advanceSharedSession(sessionId, context.messages, cursor, cwd, syncResult.epoch);
 			}
 
 			if (!isReentrant && queryCtx.activeQuery === sdkQuery) {
@@ -2577,6 +2619,7 @@ export default function (pi: ExtensionAPI) {
 		piMode = ctx.mode;
 		captureSessionId = ctx?.sessionManager?.getSessionId?.();
 		sessionBranch = () => ctx.sessionManager.getBranch();
+		sessionBranchSource = typeof ctx?.sessionManager?.getBranch === "function" ? () => ctx.sessionManager.getBranch() : undefined;
 		const globals = promptCaptureReloadGlobals();
 		if (event.reason === "reload") {
 			const carrier = globals[PROMPT_CAPTURE_RELOAD_KEY];
@@ -2794,6 +2837,7 @@ export default function (pi: ExtensionAPI) {
 		// not leave the takeover switched off.
 		compactionClaims.clear();
 		sessionBranch = undefined;
+		sessionBranchSource = undefined;
 	});
 
 	pi.on("session_before_compact", async (event, ctx) => {
