@@ -145,14 +145,20 @@ describe("error results", () => {
 	// guard that suppresses content events for a closed stream used to swallow the
 	// result message with it — so a 429 mid-tool set no stopReason, no
 	// errorMessage, and logged nothing at all.
+	//
+	// The record must not go into the turn's message, though: Pi already holds that
+	// object as a finished toolUse turn, and marking it "error" made Pi drop the call
+	// from later requests while keeping its result (2026-10-12).
 	it("records a failure that arrives after the turn ended on a tool call", async () => {
 		const c = makeCtx();
+		c.turnOutput.stopReason = "toolUse";
 		c.currentPiStream = null; // what the tool boundary leaves behind
 
 		await consume(c, [errorResult]);
 
-		assert.strictEqual(c.turnOutput.stopReason, "error");
-		assert.strictEqual(c.turnOutput.errorMessage, errorResult.result);
+		assert.strictEqual(c.closedTurnFailure, errorResult.result);
+		assert.strictEqual(c.turnOutput.stopReason, "toolUse", "the delivered message is Pi's");
+		assert.strictEqual(c.turnOutput.errorMessage, undefined);
 	});
 
 	it("reports the dedicated error subtypes", async () => {

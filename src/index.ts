@@ -1557,6 +1557,14 @@ function ensureTurnStarted(c: QueryContext): void {
 	}
 }
 
+/** The turn's message while its stream is still open. Once the stream has ended,
+ *  Pi holds that very object as a finished message (and has saved it), so it must
+ *  not change: a late abort or error marking a delivered toolUse turn "aborted"
+ *  made Pi drop the call from later requests while keeping its result. */
+function openTurnOutput(c: QueryContext): AssistantMessage | null {
+	return c.currentPiStream ? c.turnOutput : null;
+}
+
 function finalizeCurrentStream(c: QueryContext, stopReason?: string): void {
 	if (!c.currentPiStream || !c.turnOutput) return;
 	debug(`provider: finalizeCurrentStream called, stopReason=${stopReason}, turnOutput=${JSON.stringify({stopReason: c.turnOutput!.stopReason, error: c.turnOutput!.errorMessage})}`);
@@ -1795,9 +1803,12 @@ async function consumeQuery(
 					queryCtx.rateLimitRejection = null;
 				}
 				debug(`consumeQuery: error result, subtype=${message.subtype}, error=${resultError}`);
-				if (queryCtx.turnOutput) {
-					queryCtx.turnOutput.stopReason = "error";
-					queryCtx.turnOutput.errorMessage = resultError;
+				const open = openTurnOutput(queryCtx);
+				if (open) {
+					open.stopReason = "error";
+					open.errorMessage = resultError;
+				} else {
+					queryCtx.closedTurnFailure = resultError;
 				}
 			}
 		}
@@ -2391,15 +2402,17 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// Background consumer — runs until query ends
 	const done = consumeQuery(sdkQuery, customToolNameToPi, model, () => wasAborted, queryCtx)
 		.then(async ({ capturedSessionId, lastAssistantUuid }) => {
-			debug(`provider: consumeQuery completed, stopReason=${queryCtx.turnOutput?.stopReason}, error=${queryCtx.turnOutput?.errorMessage}, aborted=${wasAborted}`);
+			debug(`provider: consumeQuery completed, stopReason=${queryCtx.turnOutput?.stopReason}, error=${queryCtx.turnOutput?.errorMessage}, aborted=${wasAborted}` +
+				(queryCtx.closedTurnFailure ? `, failure after the turn went to Pi=${queryCtx.closedTurnFailure}` : ""));
 
 			// --- Abort detection in normal completion path ---
 			if (wasAborted || options?.signal?.aborted) {
 				if (sharedSession) sharedSession = { ...sharedSession, needsRebuild: true, forceRotate: true };
 				debug(`provider: abort detected, marked sharedSession needsRebuild + forceRotate`);
-				if (queryCtx.turnOutput) {
-					queryCtx.turnOutput.stopReason = "aborted";
-					queryCtx.turnOutput.errorMessage = "Operation aborted";
+				const open = openTurnOutput(queryCtx);
+				if (open) {
+					open.stopReason = "aborted";
+					open.errorMessage = "Operation aborted";
 				}
 				const stream = queryCtx.currentPiStream;
 				stream?.push({ type: "error", reason: "aborted", error: queryCtx.turnOutput! });
@@ -2440,11 +2453,12 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 				sharedSession = null;
 			}
 			promptStream.fail(error instanceof Error ? error : new Error(String(error)));
-			if (queryCtx.turnOutput) {
-				queryCtx.turnOutput.stopReason = options?.signal?.aborted ? "aborted" : "error";
+			const open = openTurnOutput(queryCtx);
+			if (open) {
+				open.stopReason = options?.signal?.aborted ? "aborted" : "error";
 				// The SDK drops its copy of the result text if any message follows the error
 				// result, so prefer the cause consumeQuery recorded off the result itself.
-				queryCtx.turnOutput.errorMessage ??= error instanceof Error ? error.message : String(error);
+				open.errorMessage ??= error instanceof Error ? error.message : String(error);
 			}
 			if (!isReentrant && queryCtx.activeQuery === sdkQuery) {
 				queryCtx.releasePendingToolCalls("Query ended");
