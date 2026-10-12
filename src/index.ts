@@ -19,6 +19,7 @@ import { extractAllToolResults as _extractAllToolResults, type McpResult } from 
 import { QueryContext, ctx } from "./query-state.js";
 import { makePromptStream, userMessage, type PromptStream } from "./prompt-stream.js";
 import { claudeCodeSettings, loadConfig, markStartupNoticeShown, type Config } from "./config.js";
+import { cacheTtlEnv, parseCacheTtl, type CacheTtl } from "./cache-ttl.js";
 import { ProviderEnvResolver, type ProviderEnv } from "./provider-env.js";
 import {
 	collectPromptSkills,
@@ -1075,6 +1076,7 @@ export const __test = {
 	resetSharedSession() {
 		sharedSession = null;
 	},
+
 	advanceSharedSession,
 	sharedPrefixChanged,
 	setSessionBranch(source: typeof sessionBranchSource) {
@@ -2091,10 +2093,13 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// --- Fresh query ---
 	const spawnCwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
 	let envConfig: ProviderEnv | undefined;
+	let cacheTtl: CacheTtl = "5m";
 	try {
 		const gone = missingWorkingDirectory(spawnCwd);
 		if (gone) throw gone;
-		envConfig = loadConfig(spawnCwd, true).provider?.env;
+		const providerConfig = loadConfig(spawnCwd, true).provider;
+		envConfig = providerConfig?.env;
+		cacheTtl = parseCacheTtl(providerConfig?.cacheTtl);
 	}
 	catch (error) {
 		stream.push({ type: "error", reason: "error", error: newAssistantOutput(model, "", "error", errorMessage(error)) });
@@ -2303,7 +2308,8 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// also autocompact would double-flush the prompt cache and races pi's
 	// threshold with CC's, including CC's anti-thrashing guard (issue #8).
 	// Manual /compact in CC still works (we never invoke it).
-	const childEnv = { ...resolvedEnv, ...(resumeInterruptedTurn ? CC_RESUME_INTERRUPTED_TURN_ENV : {}) };
+	if (cacheTtl !== "5m") debug(`provider: prompt cache TTL ${cacheTtl}`);
+	const childEnv = { ...resolvedEnv, ...cacheTtlEnv(cacheTtl), ...(resumeInterruptedTurn ? CC_RESUME_INTERRUPTED_TURN_ENV : {}) };
 	const queryOptions: NonNullable<Parameters<typeof query>[0]["options"]> = {
 		cwd,
 		env: childEnv,
