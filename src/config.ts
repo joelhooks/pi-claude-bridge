@@ -35,6 +35,8 @@ export interface Config {
 		// Anthropic billing). Enables Sonnet 4.6 [1m] on every plan and Opus 4.6
 		// [1m] on Pro.
 		longContextExtraUsage?: boolean;
+		/** Prompt-cache TTL for Claude Code children: "5m" (default) or "1h". See src/cache-ttl.ts. */
+		cacheTtl?: "5m" | "1h";
 	};
 }
 
