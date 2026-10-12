@@ -42,6 +42,9 @@ export class QueryContext {
 
 	// Per-turn (reset together)
 	turnOutput: AssistantMessage | null = null;
+	/** A failure that arrived after the turn's message went to Pi (at a tool
+	 *  boundary). That message is Pi's now and must not change; this is the record. */
+	closedTurnFailure: string | null = null;
 	turnStarted = false;
 	turnSawStreamEvent = false;
 	turnSawToolCall = false;
@@ -73,6 +76,7 @@ export class QueryContext {
 		this.turnStarted = false;
 		this.turnSawStreamEvent = false;
 		this.turnSawToolCall = false;
+		this.closedTurnFailure = null;
 		// turnToolCallIds is NOT reset — it persists across tool-result delivery
 		// callbacks within the same assistant message so results can be routed to
 		// this query while its handlers are still pending.
