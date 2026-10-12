@@ -2989,9 +2989,13 @@ export default function (pi: ExtensionAPI) {
 		}
 		const selectedTools = pi.getActiveTools?.() ?? options.selectedTools;
 		const hasRead = !selectedTools || selectedTools.includes("read");
-		const remainder = [
+		// Tools may share one guideline block; Pi lists each trimmed rule once, and so do we.
+		const guidelines = [...new Set([
 			...(options.promptGuidelines ?? []),
 			...(selectedTools ?? []).flatMap((name) => options.toolGuidelines?.[name] ?? []),
+		].map((rule) => rule.trim()))];
+		const remainder = [
+			...guidelines,
 			...Object.entries(options.sections ?? {}).filter(([, text]) => text)
 				.map(([name, text]) => `<${name}>\n${text}\n</${name}>`),
 		].filter(Boolean).join("\n\n");
