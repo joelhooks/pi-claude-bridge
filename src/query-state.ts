@@ -28,6 +28,11 @@ export class QueryContext {
 	turnToolCallIds: string[] = [];
 	/** Streaming-input handle for the active query — how steers reach CC mid-turn. */
 	promptStream: PromptStream | null = null;
+	/** A steer reached CC's stdin since its last result. CC may not have drained it, and then runs
+	 *  it as a turn of its own right after the next result, so that result must not close stdin. */
+	steerSinceResult = false;
+	/** The stdin close held back after such a result; cancelled when CC starts the queued turn. */
+	deferredInputEnd: ReturnType<typeof setTimeout> | null = null;
 	/** Kill the active query as if the user had aborted it, resolving once its state
 	 *  is released from the routing set. Installed by the provider for the lifetime
 	 *  of a query; the session_compact handler uses it to drop a Claude Code process
