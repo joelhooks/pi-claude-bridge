@@ -1765,6 +1765,32 @@ function processAssistantMessage(message: SDKMessage, model: Model<any>, customT
  *  an assistant message (completed blocks). On tool_use, the stream is ended by
  *  whichever path handles it first (processStreamEvent or processAssistantMessage),
  *  and the MCP handler blocks the generator until pi delivers the tool result. */
+/** How long stdin stays open after a result that followed a steer. CC starts a
+ *  queued steer's turn within milliseconds of the result (3 ms observed). */
+const UNDRAINED_STEER_GRACE_MS = 500;
+
+/** Close CC's stdin at a result, unless a steer went in since the last one.
+ *  CC usually drains a steer at the next model call, but not always: then the
+ *  turn ends, CC runs the steer as a turn of its own, and with stdin closed every
+ *  MCP tool call in it fails at once ("interrupted before a result was
+ *  received") and later steers are lost. So hold the close for a short grace;
+ *  consumeQuery cancels it when that turn starts, and its result closes stdin. */
+function endInputAfterResult(c: QueryContext): void {
+	if (c.deferredInputEnd) clearTimeout(c.deferredInputEnd);
+	c.deferredInputEnd = null;
+	const promptStream = c.promptStream;
+	if (!c.steerSinceResult) {
+		promptStream?.end();
+		return;
+	}
+	c.steerSinceResult = false;
+	c.deferredInputEnd = setTimeout(() => {
+		c.deferredInputEnd = null;
+		promptStream?.end();
+	}, UNDRAINED_STEER_GRACE_MS);
+	c.deferredInputEnd.unref?.();
+}
+
 async function consumeQuery(
 	sdkQuery: ReturnType<typeof query>,
 	customToolNameToPi: Map<string, string>,
@@ -1778,6 +1804,14 @@ async function consumeQuery(
 	for await (const message of sdkQuery) {
 		if (RECORD_STREAM_PATH) appendFileSync(RECORD_STREAM_PATH, `${JSON.stringify(message)}\n`);
 		if (wasAborted()) break;
+		// Output after a result that followed a steer: CC is running the steer it
+		// left queued as a new turn. Its MCP tool answers come back over stdin, so
+		// stdin stays open until that turn's own result.
+		if (queryCtx.deferredInputEnd && (message.type === "assistant" || message.type === "stream_event" || message.type === "user")) {
+			clearTimeout(queryCtx.deferredInputEnd);
+			queryCtx.deferredInputEnd = null;
+			debug("consumeQuery: CC started a turn from a steer it did not drain mid-turn; keeping stdin open");
+		}
 		// Everything below the currentPiStream guard is content, which there is
 		// nowhere to put once a turn has ended on a tool call. These three are not
 		// content and must not share that gate:
@@ -1792,7 +1826,7 @@ async function consumeQuery(
 		//   fire during exactly the long tool-using turns the guard was skipping.
 		let resultError: string | undefined;
 		if (message.type === "result") {
-			queryCtx.promptStream?.end();
+			endInputAfterResult(queryCtx);
 			logServedContextWindow("result", message, model);
 			resultError = resultErrorText(message);
 			if (resultError !== undefined) {
@@ -1941,6 +1975,7 @@ async function deliverToolResults(
 		} else {
 			try {
 				await c.promptStream.push(userMessage(steer, "next"));
+				c.steerSinceResult = true;
 				debug(`provider: steer written to CC stdin before tool result: ${text.slice(0, 60)}`);
 			} catch (error) {
 				// The query is ending — pushing further input would wedge tool-result
@@ -2198,6 +2233,10 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// contextForToolResults — which now means pushing its steer into this
 	// query's stdin, not just mismatching a map.
 	queryCtx.turnToolCallIds = [];
+	// A steer pushed into an earlier query on this context is not queued in this one.
+	queryCtx.steerSinceResult = false;
+	if (queryCtx.deferredInputEnd) clearTimeout(queryCtx.deferredInputEnd);
+	queryCtx.deferredInputEnd = null;
 	queryCtx.resetTurnState(model);
 	queryCtx.latestCursor = 0;
 
