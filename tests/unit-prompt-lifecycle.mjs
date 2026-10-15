@@ -117,6 +117,24 @@ describe("Pi 0.86 finalized prompt capture", () => {
 		assert.doesNotMatch(result, /operating inside pi|Pi documentation/);
 	});
 
+	// A tool-loop turn renders from a normalized copy of the options, so clearing
+	// forceSystemPrompt on ours does not reach the render: the "native" prompt read
+	// back is the wrapper itself. Rebasing onto that spliced the wrapper's own
+	// sections in twice, so every fresh query from the second call on carried a
+	// different system prompt than the first, and a compaction lost the cached prefix.
+	it("does not rebase a wrapper onto itself when the native read returns the wrapper", () => {
+		const h = setup(); const opts = options(); const base = buildSystemPrompt(opts);
+		h.get("before_agent_start")({ systemPrompt: base, systemPromptOptions: opts });
+		opts.forceSystemPrompt = `${base}\n\nWRAPPER-POLICY`;
+		const forced = opts.forceSystemPrompt;
+		h.get("agent_start")({}, { getSystemPrompt: () => forced });
+		const first = project(forced);
+		h.get("turn_start")({}, { getSystemPrompt: () => forced });
+		const later = project(forced);
+		assert.equal(later.split("WRAPPER-POLICY").length - 1, 1, "the wrapper's own text reaches Claude once");
+		assert.equal(later, first, "the projection does not change between calls of one run");
+	});
+
 	it("still refuses a wrapper that holds neither Pi's current prompt nor the one it started from", () => {
 		const h = setup(); const opts = options();
 		opts.sections.fixture = "TYPED-POLICY";
