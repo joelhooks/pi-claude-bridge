@@ -3001,6 +3001,10 @@ export default function (pi: ExtensionAPI) {
 					...options, sections, forceSystemPrompt: undefined,
 				});
 			} else if (nativePrompt !== undefined && wrappedBase !== undefined && wrappedBase !== nativePrompt
+				// On a tool-loop turn Pi renders from a normalized copy of the options, so
+				// the native read returns the wrapper itself. Rebasing onto that would
+				// splice the wrapper's own text in a second time.
+				&& nativePrompt !== systemPrompt
 				&& systemPrompt.indexOf(wrappedBase) !== -1
 				&& systemPrompt.indexOf(wrappedBase) === systemPrompt.lastIndexOf(wrappedBase)) {
 				// The wrapper was built around Pi's rendering at before_agent_start,
