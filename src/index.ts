@@ -78,21 +78,17 @@ const CC_CHILD_ENV = {
 	DISABLE_AUTO_COMPACT: "1",
 } as const;
 
-// Added only to a mid-turn continuation query (see midTurnContinuation). This is
-// Claude Code's own mechanism for picking up a session whose last turn was cut
-// off with tool results pending — what a worker restart looks like to it. With
-// the flag set, a --resume whose transcript tail is a tool_result carrier runs
-// the model on RESUME_PROMPT as a meta user message and streams the reply.
-// Without it, CC materializes a synthetic "Continue from where you left off." /
-// "No response requested." exchange and then waits for a prompt on stdin; both
-// behaviors are pinned in tests/int-cc-contracts.mjs. Per-query rather than in
-// CC_CHILD_ENV: a plain rebuild after an abort can leave the same tail shape,
-// and there CC running a turn the user never asked for would be wrong.
-const CC_RESUME_INTERRUPTED_TURN_ENV = {
-	CLAUDE_CODE_RESUME_INTERRUPTED_TURN: "1",
-	CLAUDE_CODE_RESUME_REASON: "pi_compaction",
-	CLAUDE_CODE_RESUME_PROMPT: "Pi compacted this conversation's history to free context. Nothing new was asked: the tool results above are the latest state of the turn in progress. Continue that work from them now, taking the next step rather than describing it.",
-} as const;
+// Sent as an ordinary prompt by a mid-turn continuation query (see
+// midTurnContinuation). Resuming a transcript whose tail is a tool_result
+// carrier, Claude Code materializes a synthetic "Continue from where you left
+// off." / "No response requested." exchange and waits for a prompt on stdin
+// (pinned in tests/int-cc-contracts.mjs); this prompt continues the work after it.
+// Not CLAUDE_CODE_RESUME_INTERRUPTED_TURN: with that flag Claude Code runs the
+// resumed turn before it reads the SDK's initialize request, which is what
+// carries Pi's system prompt, so the turn ran on Claude Code's default prompt and
+// the resumed session kept that prompt for every later turn. Pi's instructions
+// were gone and the whole cached prefix was written again.
+const MID_TURN_RESUME_PROMPT = "Pi compacted this conversation's history to free context. Nothing new was asked: the tool results above are the latest state of the turn in progress. Continue that work from them now, taking the next step rather than describing it.";
 
 // Pi owns context files on the provider path, so Claude Code must not load its
 // own on top: otherwise a project CLAUDE.md arrives twice, and the user's
@@ -2257,29 +2253,18 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	if (!isReentrant) wakeRecoveryBoundary.consume(context.messages);
 
 	// Mid-turn continuation: the rebuild above wrote pi's compacted history, tool
-	// results and all, so the transcript now ends on a tool_result carrier. With
-	// CC_RESUME_INTERRUPTED_TURN_ENV set, Claude Code treats that as an interrupted
-	// turn and continues it itself on the resume prompt — so no prompt is pushed;
-	// the parked input generator is exactly what it needs (a pushed prompt would
-	// run as a second turn after the resumed one). The tail has to be a real
-	// tool_use/tool_result pair for CC to see an interrupted turn: if conversion
-	// could not produce one there is nothing for CC to resume and it would wait on
-	// stdin forever, so fall back to sending the resume text as an ordinary
-	// prompt, which still continues the work behind CC's synthetic exchange.
-	let resumeInterruptedTurn = false;
+	// results and all, so the transcript now ends on a tool_result carrier. The
+	// resume prompt continues the turn as an ordinary prompt, so Claude Code has
+	// taken the SDK's initialize request, and Pi's system prompt with it, before
+	// the model runs (see MID_TURN_RESUME_PROMPT).
 	if (continuation) {
-		resumeInterruptedTurn = hasRebuildableToolTail(context.messages);
-		if (resumeInterruptedTurn) {
-			debug(`provider: mid-turn continuation (${continuation}) — resuming ${resumeSessionId?.slice(0, 8) ?? "none"} as an interrupted turn, no prompt pushed`);
-		} else {
-			debug(`WARNING: mid-turn continuation (${continuation}) but history does not end on a tool_use/tool_result pair; sending the resume text as a prompt instead`);
-			promptText = CC_RESUME_INTERRUPTED_TURN_ENV.CLAUDE_CODE_RESUME_PROMPT;
-		}
+		debug(`provider: mid-turn continuation (${continuation}) — resuming ${resumeSessionId?.slice(0, 8) ?? "none"} with the resume prompt`);
+		promptText = MID_TURN_RESUME_PROMPT;
 	}
 
 	// Guard: empty prompt means the last context message isn't a user message.
 	// This should never happen with per-query state — dump diagnostics if it does.
-	if (!promptText && !promptBlocks && !resumeInterruptedTurn) {
+	if (!promptText && !promptBlocks) {
 		diagDump("empty_prompt", {
 			contextLength: context.messages.length,
 			lastMsgRole: lastMsg?.role,
@@ -2299,14 +2284,12 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// first result — consumeQuery ends the stream explicitly instead, or the
 	// query would never terminate.
 	const promptStream = makePromptStream();
-	if (!resumeInterruptedTurn) {
-		void promptStream.push(userMessage(promptBlocks ?? [{ type: "text", text: promptText }]))
-			.catch((error) => debug(`provider: initial prompt push rejected:`, error));
-	}
+	void promptStream.push(userMessage(continuation ? [{ type: "text", text: promptText }] : promptBlocks ?? [{ type: "text", text: promptText }]))
+		.catch((error) => debug(`provider: initial prompt push rejected:`, error));
 	queryCtx.promptStream = promptStream;
 	const mcpServers = buildMcpServers(mcpTools, queryCtx);
-	// Claude Code's interrupted-turn resume fires its API request as soon as
-	// startup settles, without waiting for SDK MCP servers to connect; tools that
+	// Claude Code's interrupted-turn resume (which mid-turn continuations used
+	// before MID_TURN_RESUME_PROMPT) fires its API request as soon as startup settles, without waiting for SDK MCP servers to connect; tools that
 	// are not in by then are absent from the resumed turn, and the model ends it
 	// having only described the call it meant to make. CC does run
 	// UserPromptSubmit hooks for the resume prompt and blocks on them, so the hook
@@ -2359,7 +2342,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// threshold with CC's, including CC's anti-thrashing guard (issue #8).
 	// Manual /compact in CC still works (we never invoke it).
 	if (cacheTtl !== "5m") debug(`provider: prompt cache TTL ${cacheTtl}`);
-	const childEnv = { ...resolvedEnv, ...cacheTtlEnv(cacheTtl), ...(resumeInterruptedTurn ? CC_RESUME_INTERRUPTED_TURN_ENV : {}) };
+	const childEnv = { ...resolvedEnv, ...cacheTtlEnv(cacheTtl) };
 	const queryOptions: NonNullable<Parameters<typeof query>[0]["options"]> = {
 		cwd,
 		env: childEnv,
@@ -2399,7 +2382,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	debug("provider: fresh query",
 		`model=${cliModel} msgs=${context.messages.length} tools=${mcpTools.length}`,
 		`resume=${resumeSessionId?.slice(0, 8) ?? "none"}${syncResult.fork ? " (fork)" : ""} effort=${effort ?? "default"}`,
-		`mode=${resumeInterruptedTurn ? "interrupted-turn" : "prompt"}`,
+		`mode=${continuation ? "continuation" : "prompt"}`,
 		`ctxFiles=${promptCapture?.contextFiles.length ?? 0} strictMcp=${strictMcpConfigEnabled}`,
 		`prompt=${promptText.slice(0, 60)}${promptBlocks ? " [+images]" : ""}`);
 
