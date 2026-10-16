@@ -14,7 +14,9 @@
 // of fresh query does under that load. The bridge test drives the path that lost
 // its tools in real sessions: overflow recovery. CC refuses a request with
 // "Prompt is too long", pi compacts and retries, and the bridge continues the
-// turn through CC's interrupted-turn resume.
+// turn from the rebuilt session. It now does that with an ordinary resume prompt
+// rather than CC's interrupted-turn resume (see MID_TURN_RESUME_PROMPT), but the
+// gate holds every fresh query, so the contracts for both kinds still apply.
 //
 // Requires: CC logged in. Must run OUTSIDE the sandbox — CC persists session
 // state under ~/.claude. Run on its own; the race is load-sensitive.
@@ -232,7 +234,7 @@ async function overflowRound(round) {
 		assert.equal(endEvent.willRetry, true, `overflow compaction did not retry: ${JSON.stringify(endEvent).slice(0, 300)}`);
 		assert.ok(events.some((e) => /^error:.*prompt is too long/i.test(e)), `CC never refused on size (events: ${events.join(" ")})`);
 		const continuationAt = debugLog.search(/provider: mid-turn continuation \(session_compact:overflow:willRetry=true\) — resuming/);
-		assert.ok(continuationAt !== -1, "overflow recovery did not continue the turn as an interrupted-turn resume");
+		assert.ok(continuationAt !== -1, "overflow recovery did not continue the turn from the rebuilt session");
 
 		const afterCompaction = events.slice(events.indexOf("compaction_start:overflow"));
 		return {

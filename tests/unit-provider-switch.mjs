@@ -4,9 +4,11 @@
  * owns that result, and it used to be taken for an orphan: the turn ended with
  * an empty reply and the agent stopped mid-task. It has to continue instead: the
  * history, foreign tool call included, is rebuilt into a transcript that ends on
- * the tool_use/tool_result pair, and Claude Code resumes it as an interrupted
- * turn. A result for one of our own tool calls with no live query is still an
- * orphan and still ends the turn.
+ * the tool_use/tool_result pair, and Claude Code resumes it on the bridge's
+ * resume prompt. That prompt has to arrive as an ordinary prompt: Claude Code's
+ * own interrupted-turn resume runs the model before the SDK hands it Pi's system
+ * prompt, and the session keeps the prompt it ran on. A result for one of our
+ * own tool calls with no live query is still an orphan and still ends the turn.
  */
 import { describe, it, beforeEach } from "node:test";
 import assert from "node:assert/strict";
@@ -57,7 +59,7 @@ const text = (end) => end.message.content.filter((c) => c.type === "text").map((
 // Pi records the system prompt it assembled before each turn; the bridge
 // refuses a turn whose prompt it cannot account for.
 __test.setProviderSettings({ pathToClaudeCodeExecutable: fakeClaude });
-__test.promptCaptures.record("You are a coding agent.", { contextFiles: [], skills: [] });
+__test.promptCaptures.record("You are a coding agent.", { contextFiles: [{ path: join(cwd, "AGENTS.md"), content: "Project rule: keep the build green." }], skills: [] });
 
 beforeEach(() => {
 	__test.resetSharedSession();
@@ -75,8 +77,10 @@ describe("a turn that ends on a tool result after a mid-turn model switch", () =
 		assert.equal(end?.type, "done", `turn failed: ${end?.error?.errorMessage}`);
 		assert.ok(existsSync(record), "Claude Code was never started: the turn ended as an orphan");
 		const started = JSON.parse(readFileSync(record, "utf8"));
-		assert.equal(started.resumeInterruptedTurn, "1", "resumed as an interrupted turn");
 		assert.ok(started.argv.some((arg) => arg.startsWith("--resume")), "resumes the rebuilt transcript");
+		assert.equal(started.ran, "prompt", "the continuation ran before Claude Code had Pi's system prompt");
+		assert.match(started.appendAtTurn ?? "", /keep the build green/, "the continuation runs on Pi's system prompt");
+		assert.match(started.prompt, /Continue that work/, "the resume prompt continues the turn");
 		assert.deepEqual(started.tail, { type: "user", content: ["tool_result"] }, "the transcript ends on the tool result");
 		assert.match(text(end), /CONTINUED/, "the reply of the resumed turn reaches pi");
 	});

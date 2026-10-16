@@ -8,8 +8,8 @@
 // full size and pi compacted again after each tool step — an isolated summary of
 // the whole history each time, and a context that never shrank. The bridge now
 // kills the live query on session_compact and continues the turn from a session
-// rebuilt out of the compacted history, using Claude Code's own interrupted-turn
-// resume (CLAUDE_CODE_RESUME_INTERRUPTED_TURN).
+// rebuilt out of the compacted history, on an ordinary resume prompt
+// (MID_TURN_RESUME_PROMPT in src/index.ts).
 //
 // The reserve is set so the threshold trips once one large tool result is in
 // context, which is inside the turn: the prompt asks for three reads, so the
