@@ -37,6 +37,9 @@ export interface Config {
 		longContextExtraUsage?: boolean;
 		/** Prompt-cache TTL for Claude Code children: "5m" (default) or "1h". See src/cache-ttl.ts. */
 		cacheTtl?: "5m" | "1h";
+		/** "provider/model" that summarizes a compaction when Claude refuses the summary
+		 *  (its safety classifier stopped it). Unset: no fallback, the compaction is cancelled. */
+		compactionFallbackModel?: string;
 	};
 }
 

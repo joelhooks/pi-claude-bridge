@@ -1,7 +1,7 @@
 import { calculateCost, StringEnum, type AssistantMessage, type AssistantMessageEventStream, type Context, type ImageContent, type Model, type SimpleStreamOptions, type TextContent, type Tool, type UserMessage } from "@earendil-works/pi-ai";
 import * as piAi from "@earendil-works/pi-ai";
 import { getModels } from "@earendil-works/pi-ai/compat";
-import { buildSessionContext, compact, generateBranchSummary, keyHint, type BranchSummaryResult, type BuildSystemPromptOptions, type CompactionEntry, type ExtensionAPI, type ExtensionContext, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import { buildSessionContext, compact, generateBranchSummary, keyHint, type BranchSummaryResult, type BuildSystemPromptOptions, type CompactionEntry, type ExtensionAPI, type ExtensionContext, type SessionBeforeCompactEvent, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { query, type EffortLevel, type HookCallback, type SDKMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import type { Base64ImageSource, ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { Type } from "typebox";
@@ -18,7 +18,7 @@ import { verifyWrittenSession as _verifyWrittenSession } from "./session-verify.
 import { extractAllToolResults as _extractAllToolResults, type McpResult } from "./extract-tool-results.js";
 import { QueryContext, ctx } from "./query-state.js";
 import { makePromptStream, userMessage, type PromptStream } from "./prompt-stream.js";
-import { claudeCodeSettings, loadConfig, markStartupNoticeShown, type Config } from "./config.js";
+import { claudeCodeSettings, globalConfigPath, loadConfig, markStartupNoticeShown, type Config } from "./config.js";
 import { cacheTtlEnv, parseCacheTtl, type CacheTtl } from "./cache-ttl.js";
 import { ProviderEnvResolver, type ProviderEnv } from "./provider-env.js";
 import {
@@ -504,6 +504,24 @@ function missingWorkingDirectory(cwd: string): Error | undefined {
 		+ "Restart this Pi in a directory that exists, or restore the directory.");
 }
 
+// Claude's safety classifiers can stop a response (stop_reason "refusal"). On a
+// provider turn Claude Code notes it and retries once; a one-shot summary has no
+// retry, and its history usually holds whatever tripped the classifier, so the
+// same summary on Claude will be refused again. See refusedSummaryFallback.
+const SUMMARY_REFUSED = "Claude refused the compaction summary (safety classifier)";
+const REFUSAL_ERROR = /can.t help with this/i;
+
+/** One line per refusal or summary fallback, so they can be counted. Metadata only. */
+function recordRefusal(entry: Record<string, unknown>): void {
+	try {
+		const path = join(dirname(globalConfigPath()), "claude-bridge", "refusals.jsonl");
+		mkdirSync(dirname(path), { recursive: true });
+		appendFileSync(path, JSON.stringify({ t: new Date().toISOString(), ...entry }) + "\n");
+	} catch (error) {
+		debug("refusal log: write failed", error);
+	}
+}
+
 function isOneOffSummary(context: Context, options?: SimpleStreamOptions): boolean {
 	return options?.cacheRetention === "none"
 		&& (context.tools?.length ?? 0) === 0
@@ -588,6 +606,7 @@ async function runIsolatedSummary(
 		let errorText: string | undefined;
 		let resultUsage: Record<string, number | undefined> | undefined;
 		let firstEventLogged = false;
+		let refused = false;
 
 		for await (const message of sdkQuery) {
 			if (!firstEventLogged) {
@@ -597,6 +616,7 @@ async function runIsolatedSummary(
 			if (wasAborted) break;
 
 			if (message.type === "assistant") {
+				if ((message as any).message?.stop_reason === "refusal") refused = true;
 				for (const block of (message as any).message?.content ?? []) {
 					if (block.type === "text" && typeof block.text === "string") assistantText += block.text;
 				}
@@ -617,6 +637,13 @@ async function runIsolatedSummary(
 		}
 
 		const text = finalText || assistantText;
+		if (refused || (errorText && REFUSAL_ERROR.test(errorText))) {
+			const msg = `${SUMMARY_REFUSED}${errorText ? `: ${errorText}` : ""}`;
+			debug(`compact summary: ${msg}`);
+			stream.push({ type: "error", reason: "error", error: newAssistantOutput(model, "", "error", msg) });
+			stream.end();
+			return;
+		}
 		if (errorText || !text.trim()) {
 			const msg = errorText ?? "Claude Code summary returned empty text";
 			debug(`compact summary: error ${msg}`);
@@ -1667,6 +1694,13 @@ function processStreamEvent(
 	}
 
 	if (event?.type === "message_delta") {
+		if (event.delta?.stop_reason === "refusal") {
+			// Claude Code retries the turn once with a note to the model; the retry's
+			// reply follows in this same Pi message. Say so, or the cut looks like a hang.
+			debug("provider: response stopped by a safety classifier (refusal); Claude Code retries once");
+			recordRefusal({ kind: "turn", session: captureSessionId, model: model.id });
+			piUI?.notify("Claude's safety classifier stopped part of this reply. Claude Code retried once without it; check the answer is complete.", "warning");
+		}
 		c.turnOutput.stopReason = mapStopReason(event.delta?.stop_reason);
 		if (event.usage) updateUsage(c.turnOutput, event.usage, model);
 		return;
@@ -3153,10 +3187,45 @@ export default function (pi: ExtensionAPI) {
 		// A claimant re-claims at its next session_start; one that crashed must
 		// not leave the takeover switched off.
 		compactionClaims.clear();
+		compactionStopped = false;
 		sessionBranch = undefined;
 		sessionBranchSource = undefined;
 		appendSessionEntry = undefined;
 	});
+
+	// Summarize a compaction on the configured fallback model after Claude refused
+	// the summary. Only the summary moves; the session stays on its Claude model. If
+	// there is no fallback, or it fails too, say so once and stop compacting through
+	// the bridge: every later attempt would send the same history and be refused.
+	let compactionStopped = false;
+	async function refusedSummaryFallback(event: SessionBeforeCompactEvent, ctx: ExtensionContext, refusal: string) {
+		const spec = loadConfig(ctx.cwd ?? process.cwd()).provider?.compactionFallbackModel;
+		const session = ctx.sessionManager?.getSessionId?.();
+		const stop = (reason: string) => {
+			compactionStopped = true;
+			recordRefusal({ kind: "summary", session, fallback: spec ?? null, ok: false, reason });
+			debug(`session_before_compact: ${refusal}; ${reason}; compaction stopped for this session`);
+			ctx.ui?.notify?.(`${refusal}. ${reason}. This session will not compact on its own any more: switch to a non-Claude model, or start a fresh session.`, "error");
+			return { cancel: true };
+		};
+		if (!spec) return stop("No compactionFallbackModel is configured");
+		const slash = spec.indexOf("/");
+		const fallbackModel = slash > 0 ? ctx.modelRegistry?.find(spec.slice(0, slash), spec.slice(slash + 1)) : undefined;
+		if (!fallbackModel) return stop(`The fallback model ${spec} is not registered`);
+		try {
+			const auth = await ctx.modelRegistry.getApiKeyAndHeaders(fallbackModel);
+			if (auth.ok === false) return stop(`The fallback model ${spec} has no credentials (${auth.error})`);
+			const requestModel = auth.baseUrl ? { ...fallbackModel, baseUrl: auth.baseUrl } : fallbackModel;
+			const compaction = await compact(event.preparation, requestModel, auth.apiKey, auth.headers,
+				event.customInstructions, event.signal, undefined, undefined, auth.env);
+			recordRefusal({ kind: "summary", session, fallback: spec, ok: true });
+			debug(`session_before_compact: ${refusal}; summarized on ${spec} instead, summaryLen=${compaction.summary.length}`);
+			ctx.ui?.notify?.(`${refusal}. Summarized this compaction with ${spec} instead.`, "warning");
+			return { compaction };
+		} catch (err) {
+			return stop(`The fallback summary on ${spec} failed too (${errorMessage(err)})`);
+		}
+	}
 
 	pi.on("session_before_compact", async (event, ctx) => {
 		if (ctx.model?.baseUrl !== "claude-bridge") return undefined;
@@ -3171,6 +3240,10 @@ export default function (pi: ExtensionAPI) {
 			`isSplitTurn=${event.preparation.isSplitTurn} messages=${event.preparation.messagesToSummarize.length} ` +
 			`turnPrefix=${event.preparation.turnPrefixMessages.length}`,
 		);
+		if (compactionStopped) {
+			debug("session_before_compact: summaries were refused and the fallback failed earlier; not retrying");
+			return { cancel: true };
+		}
 		try {
 			reinjectPriorCompactionFileOps(event.branchEntries, event.preparation);
 			const compaction = await compact(
@@ -3188,6 +3261,8 @@ export default function (pi: ExtensionAPI) {
 			return { compaction };
 		} catch (err) {
 			const msg = errorMessage(err);
+			// Pi's compact() wraps the stream error ("Summarization failed: …").
+			if (msg.includes(SUMMARY_REFUSED)) return refusedSummaryFallback(event, ctx, msg.slice(msg.indexOf(SUMMARY_REFUSED)));
 			debug("session_before_compact: takeover failed; cancelling to avoid native compact fallback", err);
 			ctx.ui?.notify?.(
 				`Claude bridge compact failed (${msg}); cancelled to avoid known hang. Retry, switch model, or reduce context.`,
