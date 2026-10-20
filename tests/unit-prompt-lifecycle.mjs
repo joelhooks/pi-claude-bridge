@@ -70,9 +70,9 @@ describe("Pi 0.86 finalized prompt capture", () => {
 		h.get("session_start")({ reason: "reload" }, { ui: null, mode: "rpc" });
 		assert.match(wake(), /LOOP-NOTE/);
 		// Only whole trailing section blocks may be missing.
-		assert.throws(() => __test.resolveProviderCapture(bare.replace("PROJECT-POLICY", "CHANGED-POLICY")), /no capture/);
-		assert.throws(() => __test.resolveProviderCapture(bare.slice(0, -3)), /no capture/);
-		assert.throws(() => __test.resolveProviderCapture(`${bare}\n\n<other>\nX\n</other>`), /no capture/);
+		assert.throws(() => __test.resolveProviderCapture(bare.replace("PROJECT-POLICY", "CHANGED-POLICY")), /no capture|pi#5581/);
+		assert.throws(() => __test.resolveProviderCapture(bare.slice(0, -3)), /no capture|pi#5581/);
+		assert.throws(() => __test.resolveProviderCapture(`${bare}\n\n<other>\nX\n</other>`), /no capture|pi#5581/);
 	});
 
 	it("does not treat non-section trailing text as a missing section", () => {
@@ -80,7 +80,7 @@ describe("Pi 0.86 finalized prompt capture", () => {
 		const appended = `${bare}\n\nFREE-TEXT-POLICY`;
 		h.get("before_agent_start")({ systemPrompt: appended, systemPromptOptions: opts });
 		h.get("agent_start")({}, { getSystemPrompt: () => appended });
-		assert.throws(() => __test.resolveProviderCapture(bare), /no capture/);
+		assert.throws(() => __test.resolveProviderCapture(bare), /no capture|pi#5581/);
 	});
 
 	it("projects the base when an earlier extension already forced a wrapped prompt", () => {

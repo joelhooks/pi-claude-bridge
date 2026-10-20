@@ -58,7 +58,13 @@ function mockPi() {
 			for (const handler of channels.get(channel) ?? []) handler(data);
 		},
 	};
-	activate({ on: (event, handler) => handlers.set(event, handler), registerProvider: () => {}, events });
+	// Pi runs every handler registered for an event; keep them all and return the
+	// first result, as a later instance's registration listener also takes session_start.
+	const on = (event, handler) => {
+		const previous = handlers.get(event);
+		handlers.set(event, previous ? async (...args) => (await previous(...args)) ?? (await handler(...args)) : handler);
+	};
+	activate({ on, registerProvider: () => {}, events });
 	return { handlers, events, emitted };
 }
 
@@ -245,7 +251,7 @@ describe("capability handshake", () => {
 
 	it("announces itself at session start", async () => {
 		const { handlers, emitted } = mockPi();
-		await handlers.get("session_start")({ reason: "startup" }, { ui: {}, mode: "tui", sessionManager: { getSessionId: () => "s1" } });
+		await handlers.get("session_start")({ reason: "startup" }, { ui: {}, mode: "tui", sessionManager: { getSessionId: () => "s1" }, modelRegistry: { getProvider: () => ({}) } });
 		assert.equal(capabilities(emitted).length, 1);
 	});
 });

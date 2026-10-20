@@ -1,5 +1,6 @@
 import type { Skill } from "@earendil-works/pi-coding-agent";
 import { formatProjectContext } from "./agents-md.js";
+import { debugLogPath } from "./log-paths.js";
 import { renderSkillsBlock, type SkillReadTool } from "./skills.js";
 
 // What pi assembled for one agent, kept so the bridge can append only the
@@ -17,6 +18,10 @@ export type PromptCaptureInput = {
 	baseSystemPromptLengths?: readonly number[];
 	contextFiles: { path: string; content: string }[];
 	skills: Skill[];
+	/** Custom prompt sections from `systemPromptOptions.sections`, raw content keyed by
+	 *  section name. pi renders each one as `<name>\ncontent\n</name>` after the built-in
+	 *  sections; the projection does the same. */
+	sections?: Record<string, string>;
 };
 
 export type PromptCaptureSnapshot = PromptCaptureInput & {
@@ -53,6 +58,8 @@ export function findBaseSystemPromptLengths(systemPrompt: string, cwd: string): 
 
 export type PromptCapture = PromptCaptureInput & {
 	assembledPrompt: string;
+	/** Which bridge boundary last recorded this key (before_agent_start | agent_start | turn_start). */
+	source?: string;
 	/** Exact previously assembled prompts embedded in `custom`. */
 	inherited: InheritedPrompt[];
 };
@@ -76,7 +83,7 @@ export type PromptCaptureDiagnostic = {
 	 *  fresh resource discovery), which edits near the boundary, and a prefix key
 	 *  gets us to within a handful of characters of where. */
 	systemPrompt: string;
-	matches: { key: string; firstDivergent: number }[];
+	matches: { key: string; firstDivergent: number; source?: string }[];
 };
 
 export class PromptCaptures {
@@ -138,7 +145,7 @@ export class PromptCaptures {
 		for (const snapshot of snapshots) this.record(snapshot.assembledPrompt, snapshot);
 	}
 
-	record(systemPrompt: string, input: PromptCaptureInput): void {
+	record(systemPrompt: string, input: PromptCaptureInput, source?: string): void {
 		const existing = this.captures.get(systemPrompt);
 		const customChanged = existing?.custom !== input.custom;
 		const capture = existing ?? {
@@ -159,6 +166,10 @@ export class PromptCaptures {
 			: [...input.baseSystemPromptLengths];
 		capture.contextFiles = input.contextFiles.map((file) => ({ ...file }));
 		capture.skills = [...input.skills];
+		// Copied, not referenced: the caller's systemPromptOptions is a live object that
+		// later before_agent_start handlers mutate.
+		capture.sections = { ...input.sections };
+		capture.source = source;
 		if (!existing || customChanged) {
 			capture.inherited = this.findInheritedPrompts(systemPrompt, input.custom);
 		}
@@ -231,6 +242,18 @@ export class PromptCaptures {
 			return revived;
 		}
 
+		// Inheritance must be tried before any tolerance/adoption route. A sub-agent
+		// child that embeds its parent's prompt verbatim contains every portable part
+		// of the parent's capture, so an "adopt the capture whose portable parts all
+		// appear here" heuristic (as drafted in upstream PR #76's findPortableMatch)
+		// placed above this route would match first, re-key the PARENT's capture under
+		// the child's prompt, and silently drop the child's wrapper text — exactly the
+		// instruction loss the throw exists to prevent. If such a route is ever added,
+		// it belongs below this block.
+		// Both routes below need an exact shape (this prompt is a recorded base, or a
+		// permutation of whole recorded sections), which a child prompt embedding its
+		// parent's never has: it is longer than any base and adds text no section holds.
+		// So they cannot steal a child's prompt the way the comment below warns.
 		// pi.sendMessage(..., { triggerTurn: true }) starts a provider turn without
 		// before_agent_start. If tools or resources rebuilt Pi's base prompt after the
 		// prior user turn, the live prompt is that base while our only capture is the
@@ -266,13 +289,32 @@ export class PromptCaptures {
 		if (embedded.length === 0) {
 			const matches = this.closestKnown(systemPrompt);
 			this.onDiagnose({ systemPrompt, matches });
+			// The query is a recorded key minus its tail. That shape is the signature of
+			// pi#5581: an extension-triggered idle turn (sendMessage with triggerTurn) skips
+			// before_agent_start, so the prompt renders without that turn's extension
+			// additions. The capture cannot serve this turn either way, so name the bug.
+			const truncated = matches.find(
+				(m) => m.firstDivergent === systemPrompt.length && m.key.length > systemPrompt.length,
+			);
+			if (truncated) {
+				throw new Error(
+					`prompt-capture: this ${systemPrompt.length}-char prompt is the ${truncated.key.length}-char capture recorded at `
+					+ `${truncated.source ?? "an unknown boundary"} with its final ${truncated.key.length - systemPrompt.length} chars missing. `
+					+ `That shape matches pi#5581: an extension-triggered idle turn (sendMessage with triggerTurn) skips before_agent_start, `
+					+ `so the prompt lacks that turn's extension additions. The turn fails; the next user-typed turn resolves normally. `
+					+ `Workaround: when idle, send a user message instead of triggerTurn.`,
+				);
+			}
 			throw new Error(
 				`prompt-capture: no capture for this ${systemPrompt.length}-char system prompt, and it embeds none of the ${this.captures.size} known. `
-				+ `Closest known match diverges at offset ${matches[0]?.firstDivergent ?? "?"} (${matches.length ? matches[0].key.length : 0}-char key). `
+				+ `Closest known match diverges at offset ${matches[0]?.firstDivergent ?? "?"} `
+				+ `(${matches.length ? matches[0].key.length : 0}-char key${matches[0]?.source ? `, last recorded at ${matches[0].source}` : ""}). `
 				+ `Claude Code would receive none of this turn's context files, skills or custom instructions. `
 				+ (this.captures.size === 0
 					? `This process has no prompt capture. A resumed session's timer/intercom wake skips before_agent_start. `
-					: `The current prompt differs from the captured instructions, possibly after resource reload or tool changes. `)
+					: `The current prompt differs from the captured instructions, possibly after resource reload or tool changes. `
+						+ `When the divergence sits at a section's opening tag, the capture and this prompt disagree about that section `
+						+ `(pi's mcp_servers since pi 0.99.2, or one an extension added). `)
 				+ `Send an ordinary user message to refresh the capture before retrying a timer/intercom wake. `
 				+ `Reload or process restart alone does not initialize a cold resumed session. `
 				+ `No instructions were dropped or guessed.`,
@@ -342,10 +384,10 @@ export class PromptCaptures {
 	}
 
 	/** Longest shared-prefix matches, best first, for the throw diagnostic. */
-	private closestKnown(systemPrompt: string): { key: string; firstDivergent: number }[] {
+	private closestKnown(systemPrompt: string): { key: string; firstDivergent: number; source?: string }[] {
 		let shared = 0;
-		const matches: { key: string; firstDivergent: number }[] = [];
-		for (const key of this.captures.keys()) {
+		const matches: { key: string; firstDivergent: number; source?: string }[] = [];
+		for (const [key, capture] of this.captures.entries()) {
 			const limit = Math.min(key.length, systemPrompt.length);
 			let i = 0;
 			while (i < limit && key.charCodeAt(i) === systemPrompt.charCodeAt(i)) i++;
@@ -354,7 +396,7 @@ export class PromptCaptures {
 					shared = i;
 					matches.length = 0;
 				}
-				matches.push({ key, firstDivergent: i });
+				matches.push({ key, firstDivergent: i, source: capture.source });
 			}
 		}
 		return matches;
@@ -412,6 +454,30 @@ export function isExactPartPermutation(prompt: string, parts: readonly string[])
 		}
 	}
 	return rest.length === 0;
+}
+
+/** Pi's own preamble, the first section of every prompt pi renders for a session
+ *  without a custom prompt. Machine-generated, so operator text never carries it;
+ *  forwarding it makes Claude Code's subscription path read the request as a
+ *  third-party app. */
+export const PI_PREAMBLE = "You are an expert coding assistant operating inside pi";
+
+/** Both doc paths from pi's documentation-routing line. Anthropic's subscription gate
+ *  rejects a system prompt carrying both, while either alone passes (issues #883, #88). */
+const ANTHROPIC_THIRD_PARTY_TRIGGERS = ["docs/custom-provider.md", "docs/packages.md"];
+
+/** One piece of the append, named so a refusal can say where it found the text. */
+type PromptPart = { label: string; text: string };
+
+const SHARED_CAPTURES_KEY = Symbol.for("claude-bridge:promptCaptures");
+
+/** Isolated agents re-evaluate this module; a process-wide instance lets the pinned
+ *  stream resolve their captures (issue #64). The first instance's onDiagnose wins —
+ *  later callers reuse the instance as-is. Never cleared at session_shutdown: identical
+ *  keys carry identical portable parts, so cross-session reuse is safe. */
+export function sharedPromptCaptures(onDiagnose?: (diagnostic: PromptCaptureDiagnostic) => void): PromptCaptures {
+	const globals = globalThis as Record<symbol, PromptCaptures | undefined>;
+	return (globals[SHARED_CAPTURES_KEY] ??= new PromptCaptures(256, onDiagnose));
 }
 
 export function projectPromptCapture(
@@ -474,17 +540,55 @@ function projectCapture(
 			baseEnd !== undefined && baseEnd < capture.assembledPrompt.length
 				? capture.assembledPrompt.slice(baseEnd)
 				: undefined;
-		const parts = [
-			capture.projectContext ?? formatProjectContext(capture.contextFiles),
-			renderSkillsBlock(ownSkills, options.skillReadTool),
-			custom,
-			capture.append,
-			chainedAppend,
-		].filter((part): part is string => Boolean(part));
-		return parts.length > 0 ? parts.join("\n\n") : undefined;
+		// Everything Pi appended after its base prompt, custom sections included, rides in
+		// chainedAppend, so the sections are not rendered a second time here.
+		const parts: PromptPart[] = [
+			{ label: "the project context block", text: capture.projectContext ?? formatProjectContext(capture.contextFiles) },
+			{ label: "the skills block", text: renderSkillsBlock(ownSkills, options.skillReadTool) },
+			{ label: "the custom prompt", text: custom },
+			{ label: "the appended instructions", text: capture.append },
+			{ label: "the chained extension append", text: chainedAppend },
+		].filter((part): part is PromptPart => Boolean(part.text));
+		assertSendablePrompt(parts, capture);
+		return parts.length > 0 ? parts.map((part) => part.text).join("\n\n") : undefined;
 	} finally {
 		visiting.delete(capture);
 	}
+}
+
+function assertSendablePrompt(parts: readonly PromptPart[], capture: PromptCapture): void {
+	const findings: string[] = [];
+	for (const { label, text } of parts) {
+		const offset = preambleAtLineStart(text);
+		if (offset !== -1) {
+			findings.push(`pi's preamble ("${PI_PREAMBLE}") in ${label}, at offset ${offset} of ${text.length} chars`);
+		}
+		// The pair has to co-occur in one part; the two phrases split across parts are not detected.
+		if (ANTHROPIC_THIRD_PARTY_TRIGGERS.every((trigger) => text.includes(trigger))) {
+			findings.push(`${ANTHROPIC_THIRD_PARTY_TRIGGERS.join(" and ")} in ${label}`);
+		}
+	}
+	if (findings.length === 0) return;
+
+	throw new Error([
+		"prompt-capture: refusing to send this prompt. Claude Code's Anthropic path reads a request",
+		"  carrying pi's harness, or the phrase pair its subscription gate rejects, as a third-party",
+		"  app: it fails with 400 or is billed as extra usage.",
+		...findings.map((finding) => `  Found: ${finding}.`),
+		`  Capture: ${capture.source ?? "unknown"}, ${capture.inherited.length} inherited capture(s) substituted.`,
+		"  If this came from an inherited pi prompt, see README \"Compatibility with other extensions\".",
+		"  If it is your own text, reword or remove it. CLAUDE_BRIDGE_DEBUG=1 writes the full prompt to",
+		`  ${debugLogPath()}.`,
+	].join("\n"));
+}
+
+/** Offset of pi's preamble at the start of a line, or -1. Mid-line mentions are someone
+ *  describing pi's prompt, not pi's prompt. */
+function preambleAtLineStart(text: string): number {
+	for (let offset = text.indexOf(PI_PREAMBLE); offset !== -1; offset = text.indexOf(PI_PREAMBLE, offset + PI_PREAMBLE.length)) {
+		if (offset === 0 || text[offset - 1] === "\n") return offset;
+	}
+	return -1;
 }
 
 function projectCustom(
