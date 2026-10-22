@@ -87,6 +87,7 @@ Config: `~/.pi/agent/claude-bridge.json` (global) or the project Pi config direc
 - `autoMemoryEnabled` — enable Claude Code's auto-memory system (default `false`)
 - `pathToClaudeCodeExecutable` — path to the `claude` binary. Useful if your OS/filesystem has the SDK's bundled musl/glibc binaries in a place where they can't run. For example, with Nix you can set the binary to e.g. `"/home/you/.nix-profile/bin/claude"`.
 - `compactionFallbackModel` — a Pi model as `"provider/model"` that summarizes a compaction when Claude's safety classifier refuses the summary. Unset (the default): no fallback, and the session stops compacting through the bridge. Each refusal and fallback is logged to `claude-bridge/refusals.jsonl` in Pi's agent directory.
+- `toolSearch` — let Claude Code defer Pi's tools (default off: every tool is declared upfront). `true` declares only their names, and Claude loads a definition with Claude Code's `ToolSearch` tool when it needs one. `{ "alwaysLoad": ["read", "bash"] }` does the same but keeps the named Pi tools declared upfront. The prompt prefix stays cached when a tool loads. Measured with Opus 5.5 and 28 tools: the first request fell from 11,654 to 3,203 prompt tokens, and the turn after a load read 3,937 tokens from cache and wrote 83.
 
 
 **Startup notice:** the first interactive session to reach Claude Code lists whichever of `provider.plan` and `askClaude.enabled` you have left unset, then records `startupNoticeShown` (the date, `YYYY-MM-DD`) in the global config so it doesn't nag again.
