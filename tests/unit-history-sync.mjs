@@ -246,7 +246,8 @@ describe("capability handshake", () => {
 	it("answers each query with one capabilities message", () => {
 		const { events, emitted } = mockPi();
 		events.emit("claude-bridge:capabilities?", { v: 1 });
-		assert.deepEqual(capabilities(emitted), [{ v: 1, historyRewrite: 1, boundaryEvent: "flowing-view:boundary", compactionClaim: true }]);
+		assert.deepEqual(capabilities(emitted), [{ v: 1, historyRewrite: 1, boundaryEvent: "flowing-view:boundary", compactionClaim: true,
+			cacheEvent: "claude-bridge:cache", forkSummaryHeader: "x-claude-bridge-fork" }]);
 	});
 
 	it("announces itself at session start", async () => {

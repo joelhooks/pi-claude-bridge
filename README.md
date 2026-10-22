@@ -78,6 +78,12 @@ Config: `~/.pi/agent/claude-bridge.json` (global) or the project Pi config direc
 - `compactionFallbackModel` — a Pi model as `"provider/model"` that summarizes a compaction when Claude's safety classifier refuses the summary. Unset (the default): no fallback, and the session stops compacting through the bridge. Each refusal and fallback is logged to `claude-bridge/refusals.jsonl` in Pi's agent directory.
 
 
+**Compaction summaries read the prompt cache.** When Pi compacts a session on a Claude model, the bridge writes the summary on a fork of the live Claude Code conversation: the same transcript, system prompt, tools and thinking settings, with the summary instruction as one more user turn. Nothing is persisted and the live transcript is only read, so the summary pays cache-read prices for the history instead of full input. When a fork can't run (no Claude Code query has run in this process yet, the transcript is waiting for a rebuild, Pi's history no longer matches it, or the fork calls a tool), the bridge summarizes as a one-shot, as before, and logs why. A summary the safety classifier refuses still goes to `compactionFallbackModel`.
+
+Other extensions can ask for the same fork: a request carrying the header `x-claude-bridge-fork: 1`, ending on a user instruction, runs that instruction on a fork when the history before it is the live conversation, and as a one-shot of that history otherwise. The bridge announces this, and the cache event below, on `claude-bridge:capabilities`.
+
+**Cache lifetime event:** after each Claude Code API response on a live query, the bridge emits `claude-bridge:cache` on `pi.events` with `{ ttl: "5m" | "1h", sessionId, model, at }`. The conversation's prompt cache expires at `at` plus `ttl`. Forked summaries emit nothing, so they never move that expiry.
+
 **Notices:** the startup notice points out when `provider.plan` is unset and records `startupNoticeShown` in the global config. There's also a deprecation notice on first use of AskClaude that records its display date as `askClaudeDeprecationShown`.
 
 **Extension providers and models.json:** pi's `modelOverrides` in `~/.pi/agent/models.json` do not currently apply to extension-registered providers (like claude-bridge). Overriding `contextWindow` or other fields requires editing `src/models.ts` directly — to pin a model to 200K, use `provider.forceTwoHundredK` instead.
