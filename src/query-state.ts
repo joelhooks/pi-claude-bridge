@@ -38,6 +38,13 @@ export class QueryContext {
 	 *  of a query; the session_compact handler uses it to drop a Claude Code process
 	 *  whose transcript pi has just compacted out from under it. */
 	teardown: (() => Promise<void>) | null = null;
+	/** The Claude Code session this query runs, from its init message. A clean start or a
+	 *  forked resume only learns its id there, and a summary forked mid-run needs it. */
+	liveSessionId: string | null = null;
+	/** The prompt-cache lifetime this query asked for; null for queries that report none. */
+	cacheTtl: "5m" | "1h" | null = null;
+	/** The last API response announced on `claude-bridge:cache`. */
+	cacheAnnouncedId: string | null = null;
 	/** Last rate-limit rejection seen on this query. Claude Code sends it just before the
 	 *  failure it caused, which is the only thing tying the two together. */
 	rateLimitRejection: { rateLimitType?: string; resetsAt?: number } | null = null;
