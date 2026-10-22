@@ -1,7 +1,7 @@
 import { calculateCost, StringEnum, type AssistantMessage, type AssistantMessageEventStream, type Context, type ImageContent, type Model, type SimpleStreamOptions, type TextContent, type Tool, type UserMessage } from "@earendil-works/pi-ai";
 import * as piAi from "@earendil-works/pi-ai";
 import { getModels } from "@earendil-works/pi-ai/compat";
-import { buildSessionContext, compact, generateBranchSummary, keyHint, type BranchSummaryResult, type BuildSystemPromptOptions, type CompactionEntry, type ExtensionAPI, type ExtensionContext, type SessionBeforeCompactEvent, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import { buildSessionContext, compact, convertToLlm, serializeConversation, generateBranchSummary, keyHint, type BranchSummaryResult, type BuildSystemPromptOptions, type CompactionEntry, type ExtensionAPI, type ExtensionContext, type SessionBeforeCompactEvent, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { query, type EffortLevel, type HookCallback, type SDKMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import type { Base64ImageSource, ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { Type } from "typebox";
@@ -37,7 +37,8 @@ import {
 	type WakePrompt,
 } from "./prompt-capture-store.js";
 import { collectCarriedAttachments, placeCarriedAttachments, type CarriedAttachment } from "./attachments.js";
-import { createToolServer } from "./mcp-server.js";
+import { createToolServer, type McpToolDef } from "./mcp-server.js";
+import { FORK_REQUEST_HEADER, fileOperations, isForkRequest, keptStart, summaryInstruction } from "./fork-summary.js";
 import { buildActionSummary, type ToolCallState } from "./askclaude-ui.js";
 import { nonSystemMessages, toBridgeContext, transcriptPromptParts } from "./transcript.js";
 import { prefixDigest } from "./history-digest.js";
@@ -180,6 +181,11 @@ function diagDump(label: string, data: Record<string, unknown>) {
 // On session_shutdown (including /reload), clearSession() resets this so a fresh
 // registration can occur for the next session.
 const ACTIVE_STREAM_SIMPLE_KEY = Symbol.for("claude-bridge:activeStreamSimple");
+// pi.events channel for each live API response: { ttl, sessionId, model, at }.
+// The live conversation's cache expires at `at` + ttl. A forked summary reads
+// that cache but announces nothing, so it never moves the expiry.
+const CACHE_CHANNEL = "claude-bridge:cache";
+let emitPiEvent: ((channel: string, data: unknown) => void) | undefined;
 // pi.events channel answering `claude-bridge:capabilities?` (see announceCapabilities).
 const CAPABILITIES_CHANNEL = "claude-bridge:capabilities";
 
@@ -294,6 +300,22 @@ function readCarriedAttachments(sessionId: string, cwd: string): CarriedAttachme
 }
 
 let sharedSession: SessionState | null = null;
+
+/** What the top-level conversation's latest fresh query sent Claude Code, minus
+ *  what is per-spawn (env, MCP server instance, hooks, resume). A forked summary
+ *  re-sends exactly this, so it reads the live conversation's prompt cache:
+ *  tools sit first in the cached prefix, and a change of thinking settings
+ *  invalidates the cached messages. */
+interface ForkShape {
+	cwd: string;
+	options: Omit<NonNullable<Parameters<typeof query>[0]["options"]>, "env" | "mcpServers" | "hooks" | "resume" | "forkSession" | "debug" | "debugFile" | "stderr">;
+	envConfig: ProviderEnv | undefined;
+	/** Variables the live query added over the resolved provider env (cache TTL). */
+	envOverlay: Record<string, string>;
+	/** The tool list the live query's MCP server declared, without handlers. */
+	toolDefs: ToolDef[];
+}
+let forkShape: ForkShape | null = null;
 
 // Convert pi messages to Anthropic API format for session import.
 // Lossy: only text, thinking and toolCall blocks survive, and thinking only when
@@ -520,6 +542,170 @@ function recordRefusal(entry: Record<string, unknown>): void {
 	} catch (error) {
 		debug("refusal log: write failed", error);
 	}
+}
+
+// --- Forked summary (see fork-summary.ts) ---
+
+type ForkSource = { ok: true; sessionId: string; shape: ForkShape } | { ok: false; reason: string };
+
+/** The live Claude Code conversation a summary can fork, or why there is none.
+ *  Mid-run that is the running query's own session, which a clean start or a
+ *  forked resume only names in its init message. Callers still check that Pi's
+ *  history is the one the transcript holds. */
+function forkSource(): ForkSource {
+	if (!forkShape) return { ok: false, reason: "no Claude Code query has run in this process yet" };
+	if (sharedSession?.needsRebuild) return { ok: false, reason: "the Claude Code transcript is waiting for a rebuild" };
+	const live = ctx().activeQuery !== null ? ctx().liveSessionId : null;
+	const sessionId = live ?? sharedSession?.sessionId;
+	if (!sessionId) return { ok: false, reason: "there is no Claude Code transcript yet" };
+	return { ok: true, sessionId, shape: forkShape };
+}
+
+interface ForkSummaryOutcome {
+	text: string;
+	usage?: Record<string, number | undefined>;
+	refused: boolean;
+	calledTool: boolean;
+	aborted: boolean;
+	error?: string;
+}
+
+const FORK_TOOL_REFUSAL = "Tools are unavailable while this conversation is summarized. Write the summary instead.";
+
+/** One summary request on a copy of the live transcript. Nothing is persisted:
+ *  the copy exists only inside this Claude Code process, and the live
+ *  transcript is only read. */
+async function runForkedSummary(prompt: string, source: { sessionId: string; shape: ForkShape }, signal?: AbortSignal): Promise<ForkSummaryOutcome> {
+	const { shape } = source;
+	const resolved = shape.envConfig === undefined ? { ...process.env, ...CC_CHILD_ENV }
+		: await providerEnvResolver.resolve(shape.envConfig, process.env, CC_CHILD_ENV, signal);
+	providerEnvResolver.assertFresh(resolved);
+	// The same declarations as the live query; a call is refused, never run.
+	const server = createToolServer(MCP_SERVER_NAME, shape.toolDefs.map((def) => ({
+		...def,
+		handler: async () => ({ content: [{ type: "text" as const, text: FORK_TOOL_REFUSAL }], isError: true }),
+	})));
+	let gated: ReturnType<typeof query> | undefined;
+	const hooks = shape.toolDefs.length
+		? { UserPromptSubmit: [{ hooks: [makeToolListingGate(server.listed, async () => {
+			const statuses = gated ? await gated.mcpServerStatus() : [];
+			return statuses.some((s) => s.name === MCP_SERVER_NAME && s.status === "connected");
+		})] }] }
+		: undefined;
+	const promptStream = makePromptStream();
+	void promptStream.push(userMessage([{ type: "text", text: prompt }])).catch(() => {});
+	const outcome: ForkSummaryOutcome = { text: "", refused: false, calledTool: false, aborted: false };
+	const sdkQuery = query({
+		prompt: promptStream.stream,
+		options: {
+			...shape.options,
+			env: { ...resolved, ...shape.envOverlay },
+			...(shape.toolDefs.length ? { mcpServers: { [MCP_SERVER_NAME]: server } } : {}),
+			...(hooks ? { hooks } : {}),
+			resume: source.sessionId,
+			forkSession: true,
+			persistSession: false,
+			maxTurns: 1,
+			...makeCliDebugOptions("fork-summary", shape.envConfig !== undefined),
+		},
+	});
+	gated = sdkQuery;
+	const onAbort = () => {
+		outcome.aborted = true;
+		void sdkQuery.interrupt().catch(() => {});
+		try { sdkQuery.close(); } catch {}
+	};
+	if (signal?.aborted) onAbort();
+	else signal?.addEventListener("abort", onAbort, { once: true });
+	let assistantText = "";
+	try {
+		for await (const message of sdkQuery) {
+			if (outcome.aborted) break;
+			if (message.type === "system" && (message as any).subtype === "init") {
+				debug(`fork summary: forked ${source.sessionId.slice(0, 8)} into ${String((message as any).session_id).slice(0, 8)}`);
+			} else if (message.type === "assistant") {
+				const body = (message as any).message;
+				if (body?.stop_reason === "refusal") outcome.refused = true;
+				for (const block of body?.content ?? []) {
+					if (block.type === "text" && typeof block.text === "string") assistantText += block.text;
+					if (block.type === "tool_use") outcome.calledTool = true;
+				}
+			} else if (message.type === "result") {
+				outcome.error = resultErrorText(message);
+				outcome.usage = (message as { usage?: Record<string, number | undefined> }).usage;
+				if (!outcome.error && message.subtype === "success") outcome.text = (message as any).result || assistantText;
+				promptStream.end();
+			}
+		}
+	} finally {
+		signal?.removeEventListener("abort", onAbort);
+		promptStream.end();
+		try { sdkQuery.close(); } catch {}
+	}
+	outcome.text ||= assistantText;
+	if (outcome.error && REFUSAL_ERROR.test(outcome.error)) outcome.refused = true;
+	const u = outcome.usage ?? {};
+	debug(`fork summary: done refused=${outcome.refused} calledTool=${outcome.calledTool} aborted=${outcome.aborted} error=${outcome.error ?? "none"} `
+		+ `in=${u.input_tokens ?? 0} cacheRead=${u.cache_read_input_tokens ?? 0} cacheWrite=${u.cache_creation_input_tokens ?? 0} out=${u.output_tokens ?? 0} textLen=${outcome.text.length}`);
+	return outcome;
+}
+
+/** Pi-shaped usage for a Claude Code result's usage. */
+function usageMessage(model: Model<any>, text: string, usage: Record<string, number | undefined> | undefined, stopReason: AssistantMessage["stopReason"]): AssistantMessage {
+	const output = newAssistantOutput(model, text, stopReason);
+	if (usage) updateUsage(output, usage, model);
+	return output;
+}
+
+// Pi's SUMMARIZATION_SYSTEM_PROMPT, for a one-shot that arrives without one.
+const ONE_SHOT_SUMMARY_SYSTEM_PROMPT = "You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified.\n\nDo NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.";
+
+/** A summary extension's request (`x-claude-bridge-fork: 1`): Pi's history so far
+ *  plus a final user instruction. It runs on a fork of the live conversation when
+ *  the history is the one Claude Code holds; otherwise as a one-shot of the
+ *  serialized history, as on a bridge without fork support. It never touches the
+ *  live query or the shared session. */
+function forkRequestStreamFn(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
+	const stream = newAssistantMessageEventStream();
+	const fail = (reason: "error" | "aborted", message: string) => {
+		stream.push({ type: "error", reason, error: newAssistantOutput(model, "", reason, message) });
+		stream.end();
+	};
+	void (async () => {
+		const history = context.messages.slice(0, -1);
+		const last = context.messages[context.messages.length - 1];
+		const instruction = last?.role === "user" ? extractUserPrompt([last]) : "";
+		if (!instruction) return fail("error", "claude-bridge: a fork request must end with a user instruction");
+		const source = forkSource();
+		const reason = !source.ok ? source.reason
+			: sharedPrefixChanged(history) ? "the request does not continue the live Claude Code conversation"
+			: undefined;
+		if (reason || !source.ok) {
+			debug(`fork request: one-shot summary instead (${reason})`);
+			const conversation = serializeConversation(convertToLlm(history as Parameters<typeof convertToLlm>[0]));
+			const oneShot: Context = {
+				systemPrompt: context.systemPrompt ?? ONE_SHOT_SUMMARY_SYSTEM_PROMPT,
+				messages: [{ role: "user", content: `<conversation>\n${conversation}\n</conversation>\n\n${instruction}`, timestamp: Date.now() }],
+			};
+			return forwardStream(isolatedStreamFn(model, oneShot, { ...options, cacheRetention: "none" }), stream);
+		}
+		let outcome: ForkSummaryOutcome;
+		try {
+			outcome = await runForkedSummary(instruction, source, options?.signal);
+		} catch (error) {
+			return fail(options?.signal?.aborted ? "aborted" : "error", errorMessage(error));
+		}
+		if (outcome.aborted) return fail("aborted", "Operation aborted");
+		if (outcome.refused) {
+			recordRefusal({ kind: "summary", session: captureSessionId, model: model.id, fork: true });
+			return fail("error", SUMMARY_REFUSED);
+		}
+		if (outcome.error) return fail("error", outcome.error);
+		const message = usageMessage(model, outcome.text, outcome.usage, outcome.calledTool ? "toolUse" : "stop");
+		stream.push({ type: "done", reason: message.stopReason as "stop" | "toolUse", message });
+		stream.end();
+	})().catch((error) => fail("error", errorMessage(error)));
+	return stream;
 }
 
 function isOneOffSummary(context: Context, options?: SimpleStreamOptions): boolean {
@@ -1468,22 +1654,28 @@ function resolveMcpTools(context: Context, excludeToolName?: string): {
 // it, and a handler that runs first parks its resolver in `pendingToolCalls`.
 // Handlers close over the captured `queryCtx`, ensuring they operate on the
 // correct query's state while multiple queries run concurrently.
+type ToolDef = Omit<McpToolDef, "handler">;
+
+/** What the bridge's MCP server declares for Pi's tools. A forked summary declares
+ *  the same list, so it must come from here too. */
+function toolDefsFor(tools: Tool[]): ToolDef[] {
+	return tools.map((tool) => ({ name: tool.name, description: tool.description, inputSchema: tool.parameters }));
+}
+
 function buildMcpServers(tools: Tool[], queryCtx: QueryContext): Record<string, ReturnType<typeof createToolServer>> | undefined {
 	if (!tools.length) return undefined;
-	const mcpTools = tools.map((tool) => ({
-		name: tool.name,
-		description: tool.description,
-		inputSchema: tool.parameters,
+	const mcpTools = toolDefsFor(tools).map((def) => ({
+		...def,
 		handler: async (toolCallId: string) => {
 			if (queryCtx.pendingResults.has(toolCallId)) {
 				const result = queryCtx.pendingResults.get(toolCallId)!;
 				queryCtx.pendingResults.delete(toolCallId);
-				debug(`mcp handler: ${tool.name} [${toolCallId}] → resolved from queue (${queryCtx.pendingResults.size} remaining)`);
+				debug(`mcp handler: ${def.name} [${toolCallId}] → resolved from queue (${queryCtx.pendingResults.size} remaining)`);
 				return result;
 			}
-			debug(`mcp handler: ${tool.name} [${toolCallId}] → waiting`);
+			debug(`mcp handler: ${def.name} [${toolCallId}] → waiting`);
 			return new Promise<McpResult>((resolve) => {
-				queryCtx.pendingToolCalls.set(toolCallId, { toolName: tool.name, resolve });
+				queryCtx.pendingToolCalls.set(toolCallId, { toolName: def.name, resolve });
 			});
 		},
 	}));
@@ -1911,6 +2103,13 @@ async function consumeQuery(
 		// The transcript's newest assistant record, for the warm-restart pointer.
 		// Taken whether or not a Pi stream is waiting: the record is written either way.
 		if (message.type === "assistant" && message.parent_tool_use_id === null && message.uuid) lastAssistantUuid = message.uuid;
+		if (message.type === "assistant" && message.parent_tool_use_id === null && queryCtx.cacheTtl) {
+			const body = (message as { message?: { id?: string; model?: string } }).message;
+			if (body?.id && body.id !== queryCtx.cacheAnnouncedId) {
+				queryCtx.cacheAnnouncedId = body.id;
+				emitPiEvent?.(CACHE_CHANNEL, { ttl: queryCtx.cacheTtl, sessionId: capturedSessionId ?? queryCtx.liveSessionId, model: body.model, at: Date.now() });
+			}
+		}
 		if (!queryCtx.currentPiStream || !queryCtx.turnOutput) continue;
 
 		switch (message.type) {
@@ -1938,6 +2137,7 @@ async function consumeQuery(
 			case "system":
 				if ((message as any).subtype === "init" && (message as any).session_id) {
 					capturedSessionId = (message as any).session_id;
+					queryCtx.liveSessionId = capturedSessionId ?? null;
 				}
 				break;
 			case "user":
@@ -2062,6 +2262,9 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		? Object.fromEntries(Object.entries(systemState.sections).filter((entry): entry is [string, string] => typeof entry[1] === "string"))
 		: undefined;
 	context = toBridgeContext(context);
+	// A summary extension's fork request carries the whole history, wake prompts
+	// included, and must not touch the live query: route it before anything else.
+	if (isForkRequest(options)) return forkRequestStreamFn(model, context, options);
 	// Also reject concurrent/reentrant replay while execution outcome is unknown.
 	wakeRecoveryBoundary.assertNotRetired(context.messages);
 	// Pi's one-off summarizers (including /bug) deliberately disable caching
@@ -2376,7 +2579,9 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// threshold with CC's, including CC's anti-thrashing guard (issue #8).
 	// Manual /compact in CC still works (we never invoke it).
 	if (cacheTtl !== "5m") debug(`provider: prompt cache TTL ${cacheTtl}`);
-	const childEnv = { ...resolvedEnv, ...cacheTtlEnv(cacheTtl) };
+	const envOverlay = cacheTtlEnv(cacheTtl);
+	queryCtx.cacheTtl = cacheTtl;
+	const childEnv = { ...resolvedEnv, ...envOverlay };
 	const queryOptions: NonNullable<Parameters<typeof query>[0]["options"]> = {
 		cwd,
 		env: childEnv,
@@ -2419,6 +2624,11 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		`mode=${continuation ? "continuation" : "prompt"}`,
 		`ctxFiles=${promptCapture?.contextFiles.length ?? 0} strictMcp=${strictMcpConfigEnabled}`,
 		`prompt=${promptText.slice(0, 60)}${promptBlocks ? " [+images]" : ""}`);
+
+	if (!isReentrant) {
+		const { env: _env, mcpServers: _servers, hooks: _hooks, resume: _resume, forkSession: _fork, debug: _debug, debugFile: _debugFile, stderr: _stderr, ...shared } = queryOptions;
+		forkShape = { cwd, options: shared, envConfig, envOverlay, toolDefs: toolDefsFor(mcpTools) };
+	}
 
 	// 3. Start SDK query and claim it for this context
 	let wasAborted = false;
@@ -2897,6 +3107,7 @@ const PREVIEW_MAX_LINES = 6;
 let askClaudeToolName = "AskClaude";
 
 export default function (pi: ExtensionAPI) {
+	emitPiEvent = (channel, data) => pi.events?.emit(channel, data);
 	// Disable non-essential Claude Code traffic (update checks, MCP registry, telemetry)
 	process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1";
 
@@ -2925,7 +3136,8 @@ export default function (pi: ExtensionAPI) {
 	// Extensions that rewrite history check this before relying on the bridge to
 	// pass the rewrite on; an older bridge never answers, so they fail safe.
 	const announceCapabilities = () => {
-		pi.events?.emit(CAPABILITIES_CHANNEL, { v: 1, historyRewrite: 1, boundaryEvent: "flowing-view:boundary", compactionClaim: true });
+		pi.events?.emit(CAPABILITIES_CHANNEL, { v: 1, historyRewrite: 1, boundaryEvent: "flowing-view:boundary", compactionClaim: true,
+			cacheEvent: CACHE_CHANNEL, forkSummaryHeader: FORK_REQUEST_HEADER });
 	};
 
 	// Reset shared session on pi session lifecycle events
@@ -3227,6 +3439,47 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
+	// The summary on a fork of the live Claude Code conversation, which reads its
+	// prompt cache. Undefined when it cannot run, with the reason logged: the
+	// caller then summarizes as a one-shot, as before.
+	async function forkedCompaction(event: SessionBeforeCompactEvent, ctx: ExtensionContext) {
+		const oneShot = (reason: string) => {
+			debug(`session_before_compact: one-shot summary, no fork (${reason})`);
+			return undefined;
+		};
+		const source = forkSource();
+		if (!source.ok) return oneShot(source.reason);
+		const messages = buildSessionContext(event.branchEntries as Parameters<typeof buildSessionContext>[0]).messages as Context["messages"];
+		if (sharedPrefixChanged(messages)) return oneShot("Pi's history no longer matches the Claude Code transcript");
+		const { preparation } = event;
+		const kept = keptStart(event.branchEntries as Parameters<typeof keptStart>[0], preparation.firstKeptEntryId);
+		if (!kept) return oneShot("no kept message has text to mark where the summary ends");
+		let outcome: ForkSummaryOutcome;
+		try {
+			outcome = await runForkedSummary(summaryInstruction(kept, event.customInstructions), source, event.signal);
+		} catch (error) {
+			if (event.signal?.aborted) return { cancel: true as const };
+			return oneShot(`the fork failed: ${errorMessage(error)}`);
+		}
+		if (outcome.aborted) return { cancel: true as const };
+		if (outcome.refused) return refusedSummaryFallback(event, ctx, SUMMARY_REFUSED);
+		if (outcome.error) return oneShot(`the fork failed: ${outcome.error}`);
+		if (outcome.calledTool) return oneShot("the fork called a tool instead of summarizing");
+		if (!outcome.text.trim()) return oneShot("the fork returned no summary");
+		const files = fileOperations(preparation.fileOps);
+		const usage = ctx.model ? usageMessage(ctx.model, "", outcome.usage, "stop").usage : undefined;
+		debug(`session_before_compact: forked summary complete summaryLen=${outcome.text.length} kept=${kept.count}`);
+		return {
+			compaction: {
+				summary: outcome.text.trim() + files.suffix,
+				firstKeptEntryId: preparation.firstKeptEntryId,
+				tokensBefore: preparation.tokensBefore,
+				...(usage ? { usage } : {}),
+				details: { readFiles: files.readFiles, modifiedFiles: files.modifiedFiles },
+			},
+		};
+	}
+
 	pi.on("session_before_compact", async (event, ctx) => {
 		if (ctx.model?.baseUrl !== "claude-bridge") return undefined;
 		// Another extension compacts this session itself. A Claude Code summary
@@ -3246,6 +3499,8 @@ export default function (pi: ExtensionAPI) {
 		}
 		try {
 			reinjectPriorCompactionFileOps(event.branchEntries, event.preparation);
+			const forked = await forkedCompaction(event, ctx);
+			if (forked) return forked;
 			const compaction = await compact(
 				event.preparation,
 				ctx.model,
