@@ -9,7 +9,7 @@ export function transcriptPromptParts(context: Context): string[] | undefined {
 }
 
 /** Prompt/tool state is not Claude conversation history or part of its cursor. */
-export function nonSystemMessages(messages: Context["messages"]): Context["messages"] {
+export function nonSystemMessages<T extends { role: string }>(messages: readonly T[]): T[] {
 	return messages.filter((message) => message.role !== "system");
 }
 
