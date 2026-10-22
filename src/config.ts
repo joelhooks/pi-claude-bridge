@@ -12,6 +12,8 @@ import { parseProviderEnv, type ProviderEnv } from "./provider-env.js";
 export interface Config {
 	/** Date (YYYY-MM-DD) the one-time startup notice was shown. Written by the extension, not the user. */
 	startupNoticeShown?: string;
+	/** Date (YYYY-MM-DD) the AskClaude deprecation notice was shown. Written by the extension, not the user. */
+	askClaudeDeprecationShown?: string;
 	askClaude?: {
 		enabled?: boolean;
 		name?: string;
@@ -44,6 +46,9 @@ export interface Config {
 		/** "provider/model" that summarizes a compaction when Claude refuses the summary
 		 *  (its safety classifier stopped it). Unset: no fallback, the compaction is cancelled. */
 		compactionFallbackModel?: string;
+		// Model ids (e.g. "claude-future-9") whose declared 1M context Claude Code
+		// does not actually serve; pins them to the bare id at 200K.
+		forceTwoHundredK?: string[];
 	};
 }
 
@@ -100,6 +105,26 @@ export function markStartupNoticeShown(): string {
 	return path;
 }
 
+/** Record when the AskClaude deprecation notice was shown in the global config, preserving every
+ *  other field. Returns the config path either way. */
+export function markAskClaudeDeprecationNoticeShown(): string {
+	const path = globalConfigPath();
+	let existing: Partial<Config> = {};
+	if (existsSync(path)) {
+		try {
+			existing = JSON.parse(readFileSync(path, "utf-8"));
+		} catch (e) {
+			console.error(`claude-bridge: leaving ${path} alone, it does not parse: ${e}`);
+			return path;
+		}
+	}
+	// Match startupNoticeShown's local YYYY-MM-DD date format.
+	const next = { ...existing, askClaudeDeprecationShown: new Date().toLocaleDateString("en-CA") };
+	mkdirSync(dirname(path), { recursive: true });
+	writeFileSync(path, `${JSON.stringify(next, null, 2)}\n`);
+	return path;
+}
+
 export function loadConfig(cwd: string, failClosed = false): Config {
 	const global = tryParseJson(globalConfigPath(), failClosed);
 	const project = tryParseJson(join(cwd, CONFIG_DIR_NAME, "claude-bridge.json"), failClosed);
@@ -110,6 +135,7 @@ export function loadConfig(cwd: string, failClosed = false): Config {
 		? undefined : { ...globalEnv, ...projectEnv };
 	return {
 		startupNoticeShown: project.startupNoticeShown ?? global.startupNoticeShown,
+		askClaudeDeprecationShown: project.askClaudeDeprecationShown ?? global.askClaudeDeprecationShown,
 		askClaude: { ...global.askClaude, ...project.askClaude },
 		provider: { ...global.provider, ...project.provider, ...(env === undefined ? {} : { env }) },
 	};

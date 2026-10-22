@@ -8,7 +8,9 @@
  * resume prompt. That prompt has to arrive as an ordinary prompt: Claude Code's
  * own interrupted-turn resume runs the model before the SDK hands it Pi's system
  * prompt, and the session keeps the prompt it ran on. A result for one of our
- * own tool calls with no live query is still an orphan and still ends the turn.
+ * own tool calls with no live query ends the turn only when pi delivers it on an
+ * aborted signal (an abort during the tool); otherwise, after a restart or a
+ * crash, it resumes the turn the same way (upstream #174).
  */
 import { describe, it, beforeEach } from "node:test";
 import assert from "node:assert/strict";
@@ -85,13 +87,31 @@ describe("a turn that ends on a tool result after a mid-turn model switch", () =
 		assert.match(text(end), /CONTINUED/, "the reply of the resumed turn reaches pi");
 	});
 
-	it("still ends the turn on an orphaned result for one of its own tool calls", async () => {
+	it("still ends the turn on an orphaned result for one of its own tool calls after an abort", async () => {
 		const context = turnEndingOnToolResult({
 			provider: "claude-bridge", api: "claude-bridge", model: "claude-sonnet-5-5", toolCallId: "toolu_orphan",
 		});
-		const end = await terminal(__test.streamClaudeAgentSdk(model, context, { cwd }));
+		const aborted = new AbortController();
+		aborted.abort();
+		const end = await terminal(__test.streamClaudeAgentSdk(model, context, { cwd, signal: aborted.signal }));
 		assert.equal(end?.type, "done");
 		assert.equal(end.message.content.length, 0);
 		assert.equal(existsSync(record), false, "no Claude Code process for an orphan");
+	});
+
+	it("resumes the turn on a result for its own tool call that no query was parked on", async () => {
+		// A restarted process, or a durable host reopening a run, hands over history
+		// that ends at the result with a live signal and nothing parked to take it.
+		const context = turnEndingOnToolResult({
+			provider: "claude-bridge", api: "claude-bridge", model: "claude-sonnet-5-5", toolCallId: "toolu_resumed",
+		});
+		const end = await terminal(__test.streamClaudeAgentSdk(model, context, { cwd }));
+		assert.equal(end?.type, "done", `turn failed: ${end?.error?.errorMessage}`);
+		assert.ok(existsSync(record), "Claude Code was never started: the result was taken for an orphan");
+		const started = JSON.parse(readFileSync(record, "utf8"));
+		assert.equal(started.ran, "prompt", "the resume runs as an ordinary prompt, on Pi's system prompt");
+		assert.match(started.prompt, /interrupted and resumed/, "the resume prompt names the interruption");
+		assert.deepEqual(started.tail, { type: "user", content: ["tool_result"] }, "the transcript ends on the tool result");
+		assert.match(text(end), /CONTINUED/, "the reply of the resumed turn reaches pi");
 	});
 });

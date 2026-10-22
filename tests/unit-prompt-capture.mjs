@@ -2,12 +2,17 @@
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import {
 	collectPromptSkills,
 	findBaseSystemPromptLengths,
+	PI_PREAMBLE,
 	projectPromptCapture,
 	PromptCaptures,
 } from "../src/prompt-capture.js";
+
+const PI_SYSTEM_PROMPT = fileURLToPath(new URL("../node_modules/@earendil-works/pi-coding-agent/dist/core/system-prompt.js", import.meta.url));
 
 const PI_HARNESS = "You are an expert coding assistant operating inside pi. Pi documentation: pi packages (docs/packages.md).";
 const PARENT_KEY = `${PI_HARNESS}\n\n<project_context>raw parent context</project_context>\nCurrent working directory: /parent`;
@@ -107,7 +112,7 @@ describe("PromptCaptures", () => {
 		assert.doesNotMatch(projected, /Pi documentation/);
 		assert.throws(
 			() => reloaded.resolveOrDerive(base.slice(0, -2)),
-			/no capture for this .* system prompt/,
+			/prompt-capture: (no capture for this .* system prompt|this \d+-char prompt is the \d+-char capture .* pi#5581)/,
 			"an arbitrary truncated prefix must still fail closed",
 		);
 	});
@@ -239,6 +244,18 @@ describe("PromptCaptures", () => {
 		assert.equal(diagnostics[0].matches[0].firstDivergent, 14);
 	});
 
+	it("names pi#5581 when a prompt is a recorded key with its tail missing", () => {
+		const captures = new PromptCaptures();
+		// The issue #144 shape: the next turn's prompt is the last recorded key with the
+		// extension's additions gone, because the idle triggerTurn skipped before_agent_start.
+		captures.record(`${PARENT_KEY}\n\n<skills>extension additions</skills>`, capture(), "turn_start");
+
+		assert.throws(
+			() => captures.resolveOrDerive(PARENT_KEY),
+			/pi#5581/,
+		);
+	});
+
 	it("recursively projects an inherited prompt without Pi's harness", () => {
 		const browser = skill("browser");
 		const captures = new PromptCaptures();
@@ -364,5 +381,27 @@ describe("PromptCaptures", () => {
 		assert.equal(captures.resolve("b"), undefined);
 		assert.equal(captures.resolve("a").custom, "refreshed");
 		assert.ok(captures.resolve("c") && captures.resolve("d"));
+	});
+});
+
+describe("capture provenance", () => {
+	it("records which boundary last wrote a key", () => {
+		const captures = new PromptCaptures();
+		captures.record("key", capture(), "agent_start");
+
+		assert.equal(captures.resolve("key").source, "agent_start");
+		captures.record("key", capture(), "turn_start");
+		assert.equal(captures.resolve("key").source, "turn_start", "a re-record replaces the earlier source");
+	});
+
+	it("names the closest match's boundary in a throw", () => {
+		const captures = new PromptCaptures();
+		captures.record("prefix-common-THE-REST", capture(), "agent_start");
+
+		assert.throws(
+			() => captures.resolveOrDerive("prefix-common-WHO-ARE-YOU"),
+			/recorded at agent_start/,
+			"the diagnostic must say which boundary last recorded the closest known prompt",
+		);
 	});
 });
