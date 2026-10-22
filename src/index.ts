@@ -20,6 +20,7 @@ import { QueryContext, ctx } from "./query-state.js";
 import { makePromptStream, userMessage, type PromptStream } from "./prompt-stream.js";
 import { claudeCodeSettings, globalConfigPath, loadConfig, markStartupNoticeShown, type Config } from "./config.js";
 import { cacheTtlEnv, parseCacheTtl, type CacheTtl } from "./cache-ttl.js";
+import { TOOL_SEARCH_TOOL, toolSearchPlan, toolSearchQueryOptions, type ToolSearchPlan } from "./tool-search.js";
 import { ProviderEnvResolver, type ProviderEnv } from "./provider-env.js";
 import {
 	collectPromptSkills,
@@ -1372,7 +1373,8 @@ function mapToolName(name: string): string {
 }
 
 // Provider path: the query runs with `tools: []`, so the only tools CC can
-// legitimately call are the pi tools we serve over MCP. Any other name is the
+// legitimately call are the pi tools we serve over MCP, plus CC's own
+// `ToolSearch` when tool search is on (CC runs that itself, never pi). Any other name is the
 // model hallucinating a builtin (`bash`, `Bash`, `Edit`, an MCP server we don't
 // serve). CC answers those itself with "No such tool available" and retries
 // inside the same query, never dispatching them to our MCP server — so a tool
@@ -1677,13 +1679,15 @@ type ToolDef = Omit<McpToolDef, "handler">;
 
 /** What the bridge's MCP server declares for Pi's tools. A forked summary declares
  *  the same list, so it must come from here too. */
-function toolDefsFor(tools: Tool[]): ToolDef[] {
-	return tools.map((tool) => ({ name: tool.name, description: tool.description, inputSchema: tool.parameters }));
+function toolDefsFor(tools: Tool[], alwaysLoad: ReadonlySet<string> = new Set()): ToolDef[] {
+	return tools.map((tool) => ({ name: tool.name, description: tool.description, inputSchema: tool.parameters, alwaysLoad: alwaysLoad.has(tool.name) }));
 }
 
-function buildMcpServers(tools: Tool[], queryCtx: QueryContext): Record<string, ReturnType<typeof createToolServer>> | undefined {
+function buildMcpServers(
+	tools: Tool[], queryCtx: QueryContext, alwaysLoad: ReadonlySet<string> = new Set(),
+): Record<string, ReturnType<typeof createToolServer>> | undefined {
 	if (!tools.length) return undefined;
-	const mcpTools = toolDefsFor(tools).map((def) => ({
+	const mcpTools = toolDefsFor(tools, alwaysLoad).map((def) => ({
 		...def,
 		handler: async (toolCallId: string) => {
 			if (queryCtx.pendingResults.has(toolCallId)) {
@@ -1870,7 +1874,7 @@ function processStreamEvent(
 		} else if (event.content_block?.type === "tool_use") {
 			const piName = piToolNameFor(event.content_block.name, customToolNameToPi);
 			if (!piName) {
-				debug(`processStreamEvent: skipping tool_use for unserved tool ${event.content_block.name} [${event.content_block.id}] — CC rejects it and retries`);
+				debug(`processStreamEvent: skipping tool_use for unserved tool ${event.content_block.name} [${event.content_block.id}] — ${event.content_block.name === TOOL_SEARCH_TOOL ? "CC runs its tool search" : "CC rejects it and retries"}`);
 				return;
 			}
 			c.turnToolCallIds.push(event.content_block.id);
@@ -2510,12 +2514,14 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	const spawnCwd = (options as { cwd?: string } | undefined)?.cwd ?? sessionCwdFor(options?.sessionId);
 	let envConfig: ProviderEnv | undefined;
 	let cacheTtl: CacheTtl = "5m";
+	let toolSearch: ToolSearchPlan = toolSearchPlan(undefined);
 	try {
 		const gone = missingWorkingDirectory(spawnCwd);
 		if (gone) throw gone;
 		const providerConfig = loadConfig(spawnCwd, true).provider;
 		envConfig = providerConfig?.env;
 		cacheTtl = parseCacheTtl(providerConfig?.cacheTtl);
+		toolSearch = toolSearchPlan(providerConfig?.toolSearch);
 	}
 	catch (error) {
 		stream.push({ type: "error", reason: "error", error: newAssistantOutput(model, "", "error", errorMessage(error)) });
@@ -2663,7 +2669,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	void promptStream.push(userMessage(continuation ? [{ type: "text", text: promptText }] : promptBlocks ?? [{ type: "text", text: promptText }]))
 		.catch((error) => debug(`provider: initial prompt push rejected:`, error));
 	queryCtx.promptStream = promptStream;
-	const mcpServers = buildMcpServers(mcpTools, queryCtx);
+	const mcpServers = buildMcpServers(mcpTools, queryCtx, toolSearch.alwaysLoad);
 	// Claude Code's interrupted-turn resume (which mid-turn continuations used
 	// before MID_TURN_RESUME_PROMPT) fires its API request as soon as startup settles, without waiting for SDK MCP servers to connect; tools that
 	// are not in by then are absent from the resumed turn, and the model ends it
@@ -2713,13 +2719,17 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// threshold with CC's, including CC's anti-thrashing guard (issue #8).
 	// Manual /compact in CC still works (we never invoke it).
 	if (cacheTtl !== "5m") debug(`provider: prompt cache TTL ${cacheTtl}`);
-	const envOverlay = cacheTtlEnv(cacheTtl);
+	const toolSearchOptions = toolSearchQueryOptions(toolSearch);
+	if (toolSearch.enabled) debug(`provider: tool search on, ${toolSearch.alwaysLoad.size} tool(s) always loaded`);
+	// Everything this query adds over the resolved provider env; a forked summary re-sends it.
+	const envOverlay = { ...cacheTtlEnv(cacheTtl), ...toolSearchOptions.env };
 	queryCtx.cacheTtl = cacheTtl;
 	const childEnv = { ...resolvedEnv, ...envOverlay };
 	const queryOptions: NonNullable<Parameters<typeof query>[0]["options"]> = {
 		cwd,
 		env: childEnv,
-		tools: [],
+		// Empty unless tool search is on, which needs Claude Code's own ToolSearch.
+		tools: toolSearchOptions.tools,
 		permissionMode: "bypassPermissions",
 		includePartialMessages: true,
 		// includeGitInstructions:false drops the gitStatus block from the preset.
@@ -2761,7 +2771,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 
 	if (!isReentrant) {
 		const { env: _env, mcpServers: _servers, hooks: _hooks, resume: _resume, forkSession: _fork, debug: _debug, debugFile: _debugFile, stderr: _stderr, ...shared } = queryOptions;
-		forkShape = { cwd, options: shared, envConfig, envOverlay, toolDefs: toolDefsFor(mcpTools) };
+		forkShape = { cwd, options: shared, envConfig, envOverlay, toolDefs: toolDefsFor(mcpTools, toolSearch.alwaysLoad) };
 	}
 
 	// 3. Start SDK query and claim it for this context

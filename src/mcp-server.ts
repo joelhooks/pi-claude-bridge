@@ -43,6 +43,8 @@ export interface McpToolDef {
 	name: string;
 	description: string;
 	inputSchema: unknown;
+	/** Declared upfront even when Claude Code's tool search defers the rest. */
+	alwaysLoad?: boolean;
 	handler: (toolCallId: string) => Promise<McpResult>;
 }
 
@@ -158,6 +160,7 @@ export function createToolServer(name: string, tools: McpToolDef[]) {
 					name: tool.name,
 					description: [note, tool.description].filter(Boolean).join("\n\n"),
 					inputSchema: schema,
+					...(tool.alwaysLoad ? { _meta: { "anthropic/alwaysLoad": true } } : {}),
 				};
 			}),
 		};

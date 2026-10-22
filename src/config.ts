@@ -39,6 +39,10 @@ export interface Config {
 		longContextExtraUsage?: boolean;
 		/** Prompt-cache TTL for Claude Code children: "5m" (default) or "1h". See src/cache-ttl.ts. */
 		cacheTtl?: "5m" | "1h";
+		/** Claude Code tool search: Pi tools are declared deferred and loaded on demand.
+		 *  `true` defers them all; `{ alwaysLoad: [...] }` keeps the named Pi tools upfront.
+		 *  Unset or false loads every tool upfront. See src/tool-search.ts. */
+		toolSearch?: boolean | { alwaysLoad?: string[] };
 		/** "provider/model" that summarizes a compaction when Claude refuses the summary
 		 *  (its safety classifier stopped it). Unset: no fallback, the compaction is cancelled. */
 		compactionFallbackModel?: string;
