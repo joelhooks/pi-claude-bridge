@@ -82,6 +82,14 @@ const CC_CHILD_ENV = {
 	DISABLE_AUTO_COMPACT: "1",
 } as const;
 
+/** Defaults precede provider.env; safety controls are applied separately. */
+function inheritedChildEnv(): NodeJS.ProcessEnv {
+	return {
+		...process.env,
+		CLAUDE_CODE_MAX_RETRIES: process.env.CLAUDE_CODE_MAX_RETRIES ?? "15",
+	};
+}
+
 // Sent as an ordinary prompt by a mid-turn continuation query (see
 // midTurnContinuation). Resuming a transcript whose tail is a tool_result
 // carrier, Claude Code materializes a synthetic "Continue from where you left
@@ -579,8 +587,8 @@ const FORK_TOOL_REFUSAL = "Tools are unavailable while this conversation is summ
  *  transcript is only read. */
 async function runForkedSummary(prompt: string, source: { sessionId: string; shape: ForkShape }, signal?: AbortSignal): Promise<ForkSummaryOutcome> {
 	const { shape } = source;
-	const resolved = shape.envConfig === undefined ? { ...process.env, ...CC_CHILD_ENV }
-		: await providerEnvResolver.resolve(shape.envConfig, process.env, CC_CHILD_ENV, signal);
+	const resolved = shape.envConfig === undefined ? { ...inheritedChildEnv(), ...CC_CHILD_ENV }
+		: await providerEnvResolver.resolve(shape.envConfig, inheritedChildEnv(), CC_CHILD_ENV, signal);
 	providerEnvResolver.assertFresh(resolved);
 	// The same declarations as the live query; a call is refused, never run.
 	const server = createToolServer(MCP_SERVER_NAME, shape.toolDefs.map((def) => ({
@@ -764,8 +772,8 @@ async function runIsolatedSummary(
 		const claudeExecutable = compactProviderSettings?.pathToClaudeCodeExecutable;
 		const cliModel = claudeCodeModelId(model, longContextSettings);
 		const envConfig = compactProviderSettings?.env;
-		const childEnv = envConfig === undefined ? { ...process.env, ...CC_CHILD_ENV }
-			: await providerEnvResolver.resolve(envConfig, process.env, CC_CHILD_ENV, options?.signal);
+		const childEnv = envConfig === undefined ? { ...inheritedChildEnv(), ...CC_CHILD_ENV }
+			: await providerEnvResolver.resolve(envConfig, inheritedChildEnv(), CC_CHILD_ENV, options?.signal);
 		// Same mapping as a provider turn: Pi's compaction and branch summaries pass
 		// the session's thinking level.
 		const effort = effortForReasoning(model, options?.reasoning);
@@ -2913,8 +2921,8 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	return stream;
 	};
 	// No env block: original synchronous spawn path, no lease or extra microtask.
-	if (envConfig === undefined) return startQuery({ ...process.env, ...CC_CHILD_ENV });
-	void providerEnvResolver.resolve(envConfig, process.env, CC_CHILD_ENV, options?.signal)
+	if (envConfig === undefined) return startQuery({ ...inheritedChildEnv(), ...CC_CHILD_ENV });
+	void providerEnvResolver.resolve(envConfig, inheritedChildEnv(), CC_CHILD_ENV, options?.signal)
 		.then((env) => startQuery(env))
 		.catch((error) => {
 			// Resolution failures never spawn or fall back to stored Claude login.
@@ -3133,8 +3141,8 @@ async function promptAndWait(
 	// tools, so it has to be asked for. Pi-side skills still arrive via skillsBlock below,
 	// which is meant to be the only channel.
 	const envConfig = loadConfig(cwd, true).provider?.env;
-	const childEnv = envConfig === undefined ? { ...process.env, ...CC_CHILD_ENV }
-		: await providerEnvResolver.resolve(envConfig, process.env, CC_CHILD_ENV, signal);
+	const childEnv = envConfig === undefined ? { ...inheritedChildEnv(), ...CC_CHILD_ENV }
+		: await providerEnvResolver.resolve(envConfig, inheritedChildEnv(), CC_CHILD_ENV, signal);
 	providerEnvResolver.assertFresh(childEnv);
 	const sdkQuery = query({
 		prompt,

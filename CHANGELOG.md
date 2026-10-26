@@ -2,6 +2,8 @@
 
 ## UNRELEASED
 
+- **Fix: tolerate refused proxy connections longer** — default `CLAUDE_CODE_MAX_RETRIES` to `15` for every Claude Code child, giving immediate connection refusals about 5–7 minutes of Claude Code's own backoff. Process env and `provider.env` override the default. Session IDs and bridge query lifecycle are unchanged.
+
 ### Fork (joelhooks/pi-claude-bridge)
 
 Fork-only changes not yet upstream. The fork keeps the compaction takeover that upstream removed in #189: it carries the refused-summary fallback, stops after one failed fallback, and cancels instead of falling through to native compaction. Pi 1.3's native path does not cover those cases: it sends the summary through the full provider stream with no timeout, has no fallback model for a refused summary, and retries a failed compaction at every threshold check with no backoff.
