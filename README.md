@@ -69,6 +69,7 @@ Config: `~/.pi/agent/claude-bridge.json` (global) or the project Pi config direc
 - `appendSkills` — forward pi's skills block into the system prompt (default `true`)
 
 `provider`:
+- `env` — child environment overrides; `CLAUDE_CODE_MAX_RETRIES` defaults to `15` (about 5–7 minutes of Claude Code's own backoff for immediate connection refusals), unless process env or `provider.env` supplies a value; `provider.env` takes precedence.
 - `plan` (default `"pro"`) — set to `"max"` if you have a Max (or Team Premium/Enterprise) Anthropic plan. This enables Opus with 1M context.
 - `longContextExtraUsage` — set to `true` to enable 1M context models even if they cost money through Extra Usage on your plan. It enables Sonnet 4.6 with 1M on every plan and Opus 4.6 with 1M on Pro. Not needed for Opus 4.7 or 4.8.
 - `forceTwoHundredK` — array of model ids to pin to 200K context (bare id, no `[1m]` suffix). Use if pi-ai declares a model at 1M but Claude Code won't serve it on your plan.

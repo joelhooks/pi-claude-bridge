@@ -2,6 +2,7 @@
 
 ## UNRELEASED
 
+- **Fix: tolerate refused proxy connections longer** — default `CLAUDE_CODE_MAX_RETRIES` to `15` for every Claude Code child, giving immediate connection refusals about 5–7 minutes of Claude Code's own backoff. Process env and `provider.env` override the default. Session IDs and bridge query lifecycle are unchanged.
 - **Fix: count every API request within a Pi message** — sum billable input, output, cache-read and cache-write tokens (and their derived costs) across tool-search rounds and retries. Repeated stream frames and assistant records update the same API message id instead of counting it again. `usage.totalTokens` stays the latest request's prompt plus output, which Pi uses for context estimation and compaction, rather than the cumulative billed total. Query-wide result usage remains separate from live per-request accounting; result-only summary routes keep their existing accounting. Fake Claude Code regressions cover streaming and non-streaming multi-request replies, repeated frames, duplicate records and per-Pi-message reset.
 
 ### Fork (joelhooks/pi-claude-bridge)
