@@ -1715,17 +1715,37 @@ function buildMcpServers(
 
 // --- Usage helpers ---
 
-function updateUsage(output: AssistantMessage, usage: Record<string, number | undefined>, model: Model<any>): void {
-	if (usage.input_tokens != null) output.usage.input = usage.input_tokens;
-	if (usage.output_tokens != null) output.usage.output = usage.output_tokens;
-	if (usage.cache_read_input_tokens != null) output.usage.cacheRead = usage.cache_read_input_tokens;
-	if (usage.cache_creation_input_tokens != null) output.usage.cacheWrite = usage.cache_creation_input_tokens;
+// Scoped to the Pi message, not the long-lived Claude Code query. Frames and
+// completed assistant records repeat cumulative counters for the same API id.
+const requestUsage = new WeakMap<AssistantMessage, Map<string, { input: number; output: number; cacheRead: number; cacheWrite: number }>>();
+
+function updateUsage(output: AssistantMessage, usage: Record<string, number | undefined>, model: Model<any>, requestId = "single"): void {
+	let requests = requestUsage.get(output);
+	if (!requests) requestUsage.set(output, requests = new Map());
+	let request = requests.get(requestId);
+	if (!request) {
+		request = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+		requests.set(requestId, request);
+	}
+	for (const [source, target] of [
+		["input_tokens", "input"], ["output_tokens", "output"],
+		["cache_read_input_tokens", "cacheRead"], ["cache_creation_input_tokens", "cacheWrite"],
+	] as const) {
+		const value = usage[source];
+		if (value == null) continue;
+		output.usage[target] += value - request[target];
+		request[target] = value;
+	}
 	// Claude Code may report reasoning/thinking tokens separately, while pi's Usage type does not model that field.
 	// The SDK nests them under output_tokens_details (upstream de007f9); the flat names are older shapes.
 	const details = (usage as { output_tokens_details?: { thinking_tokens?: number } }).output_tokens_details;
 	const reasoning = details?.thinking_tokens ?? usage.reasoning_tokens ?? usage.thinking_tokens;
 	if (reasoning != null) (output.usage as typeof output.usage & { reasoning?: number }).reasoning = reasoning;
-	output.usage.totalTokens = output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
+	// Pi's calculateContextTokens reads totalTokens before the billable counters.
+	// Keep its usual prompt + output occupancy for the latest API request only;
+	// input/output/cache counters and calculateCost cover ALL requests in this message.
+	const latest = [...requests.values()].at(-1)!;
+	output.usage.totalTokens = latest.input + latest.output + latest.cacheRead + latest.cacheWrite;
 	calculateCost(model, output.usage);
 	const promptTokens = output.usage.input + output.usage.cacheRead + output.usage.cacheWrite;
 	const cachePct = promptTokens > 0 ? Math.round(output.usage.cacheRead / promptTokens * 100) : 0;
@@ -1867,7 +1887,7 @@ function processStreamEvent(
 		c.turnStreamMessageId = event.message?.id;
 		c.turnStreamOpen = true;
 		c.turnStreamBlockStart = c.turnBlocks.length;
-		if (event.message?.usage) updateUsage(c.turnOutput, event.message.usage, model);
+		if (event.message?.usage) updateUsage(c.turnOutput, event.message.usage, model, c.turnStreamMessageId);
 		return;
 	}
 
@@ -1950,7 +1970,7 @@ function processStreamEvent(
 			piUI?.notify("Claude's safety classifier stopped part of this reply. Claude Code retried once without it; check the answer is complete.", "warning");
 		}
 		c.turnOutput.stopReason = mapStopReason(event.delta?.stop_reason);
-		if (event.usage) updateUsage(c.turnOutput, event.usage, model);
+		if (event.usage) updateUsage(c.turnOutput, event.usage, model, c.turnStreamMessageId);
 		return;
 	}
 
@@ -2067,7 +2087,10 @@ function processAssistantMessage(message: SDKMessage, model: Model<any>, customT
 		// Drop the stalled stream's partial blocks if it never stopped. Deliberately
 		// deliver even if it stopped, at the risk of duplication if CC renumbers it.
 		const id = assistantMsg.id;
-		if (!id || !c.turnStreamMessageId || id === c.turnStreamMessageId) return;
+		if (!id || !c.turnStreamMessageId || id === c.turnStreamMessageId) {
+			if (assistantMsg.usage && c.turnOutput) updateUsage(c.turnOutput, assistantMsg.usage, model, id ?? c.turnStreamMessageId);
+			return;
+		}
 		if (c.turnStreamOpen) dropAbandonedStreamBlocks(c, `non-streaming fallback ${id}`);
 	}
 	c.turnToolCallIds = [];
@@ -2109,7 +2132,7 @@ function processAssistantMessage(message: SDKMessage, model: Model<any>, customT
 			debug("processAssistantMessage: unhandled block type", block.type);
 		}
 	}
-	if (assistantMsg.usage && c.turnOutput) updateUsage(c.turnOutput, assistantMsg.usage, model);
+	if (assistantMsg.usage && c.turnOutput) updateUsage(c.turnOutput, assistantMsg.usage, model, assistantMsg.id);
 
 	// End the stream on tool_use, same as processStreamEvent's message_stop handler.
 	if (c.turnSawToolCall && c.currentPiStream && c.turnOutput) {
