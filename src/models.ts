@@ -29,8 +29,29 @@ function versionRank(id: string): { family: string; tuple: [number, number] } {
 	return { family, tuple: [Number(major) || 0, Number(minor) || 0] };
 }
 
+// Models Claude Code serves that pi-ai's catalog may not list yet. Each is
+// cloned from a same-generation catalog entry (limits, input, thinking map)
+// and appended only while the catalog lacks the id, so a pi-ai update that
+// adds it takes over with no change here. Ids come from Anthropic's model
+// docs; Claude Code 2.1.321 is the first CLI that accepts them.
+const SUPPLEMENTAL_MODELS: { id: string; name: string; cloneFrom: string }[] = [
+	{ id: "claude-fable-5-2", name: "Claude Fable 5.2", cloneFrom: "claude-fable-5-1" },
+	{ id: "claude-mythos-5-2", name: "Claude Mythos 5.2", cloneFrom: "claude-fable-5-1" },
+];
+
+export function withSupplementalModels<T extends { id: string; name?: string }>(piAiModels: T[]): T[] {
+	const ids = new Set(piAiModels.map((m) => m.id));
+	const extra: T[] = [];
+	for (const s of SUPPLEMENTAL_MODELS) {
+		if (ids.has(s.id)) continue;
+		const base = piAiModels.find((m) => m.id === s.cloneFrom);
+		if (base) extra.push({ ...base, id: s.id, name: s.name });
+	}
+	return extra.length ? [...piAiModels, ...extra] : piAiModels;
+}
+
 export function buildModels<T extends { id: string; [key: string]: any }>(piAiModels: T[]) {
-	return piAiModels
+	return withSupplementalModels(piAiModels)
 		.filter((m) => typeof m.id === "string" && !isDatedAlias(m.id))
 		.sort((a, b) => {
 			const fa = FAMILY_ORDER.indexOf(versionRank(a.id).family);

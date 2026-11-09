@@ -26,8 +26,10 @@ writeFileSync(script, `
 import { writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 const argv = process.argv.slice(2);
+// SDK 0.3.321 passes --tools=<v>; older SDKs pass --tools <v>.
 const toolsAt = argv.indexOf("--tools");
-const seen = { tools: toolsAt === -1 ? null : argv[toolsAt + 1], enableToolSearch: process.env.ENABLE_TOOL_SEARCH ?? null, listed: null };
+const toolsEq = argv.find((a) => a.startsWith("--tools="));
+const seen = { tools: toolsEq !== undefined ? toolsEq.slice("--tools=".length) : toolsAt === -1 ? null : argv[toolsAt + 1], enableToolSearch: process.env.ENABLE_TOOL_SEARCH ?? null, listed: null };
 const send = (m) => process.stdout.write(JSON.stringify(m) + "\\n");
 const session_id = "00000000-0000-4000-8000-000000000005";
 const waiting = new Map();
