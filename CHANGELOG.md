@@ -2,6 +2,8 @@
 
 ## UNRELEASED
 
+- **Add: Claude Fable 5.2 and Mythos 5.2** — register `claude-fable-5-2` and `claude-mythos-5-2` (cloned from the Fable 5.1 catalog entry) while pi-ai's catalog lacks them, so the `fable` shortcut resolves to 5.2 and `claude-fable-5-1` stays selectable by id. Both serve bare at 200K until measured for `[1m]`.
+- **Bump: Claude Agent SDK 0.3.293 → 0.3.321** — the first bundled Claude Code (2.1.321) that accepts the 5.2 ids. The SDK now passes CLI flags as `--flag=value`; the two argv-reading test fakes accept both forms.
 - **Fix: tolerate refused proxy connections longer** — default `CLAUDE_CODE_MAX_RETRIES` to `15` for every Claude Code child, giving immediate connection refusals about 5–7 minutes of Claude Code's own backoff. Process env and `provider.env` override the default. Session IDs and bridge query lifecycle are unchanged.
 - **Fix: count every API request within a Pi message** — sum billable input, output, cache-read and cache-write tokens (and their derived costs) across tool-search rounds and retries. Repeated stream frames and assistant records update the same API message id instead of counting it again. `usage.totalTokens` stays the latest request's prompt plus output, which Pi uses for context estimation and compaction, rather than the cumulative billed total. Query-wide result usage remains separate from live per-request accounting; result-only summary routes keep their existing accounting. Fake Claude Code regressions cover streaming and non-streaming multi-request replies, repeated frames, duplicate records and per-Pi-message reset.
 

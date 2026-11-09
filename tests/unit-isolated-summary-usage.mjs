@@ -55,7 +55,9 @@ describe("isolated summary route", () => {
 	it("runs at the requested thinking level", async () => {
 		await summarize({ reasoning: "high" });
 		const argv = JSON.parse(readFileSync(argvFile, "utf8"));
-		assert.equal(argv[argv.indexOf("--effort") + 1], "high", `no --effort high in ${JSON.stringify(argv)}`);
+		// SDK 0.3.321 passes --effort=<v>; older SDKs pass --effort <v>.
+		const effort = argv.find((a) => a.startsWith("--effort="))?.slice("--effort=".length) ?? argv[argv.indexOf("--effort") + 1];
+		assert.equal(effort, "high", `no --effort high in ${JSON.stringify(argv)}`);
 	});
 
 	// Pi asks for no cache retention on a one-off summary: nothing will read the

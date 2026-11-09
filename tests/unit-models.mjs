@@ -95,6 +95,39 @@ describe("resolveModel", () => {
 	it("exact id beats newer partial match (claude-fable-5 → fable-5, not 5-1)", () => {
 		assert.equal(resolveModel(models, "claude-fable-5")?.id, "claude-fable-5");
 	});
+
+	it("fable shortcut resolves to 5.2; 5.1 and mythos 5.2 stay selectable by id", () => {
+		assert.equal(resolveModel(models, "fable")?.id, "claude-fable-5-2");
+		assert.equal(resolveModel(models, "claude-fable-5-1")?.id, "claude-fable-5-1");
+		assert.equal(resolveModel(models, "claude-mythos-5-2")?.id, "claude-mythos-5-2");
+		assert.equal(resolveModel(models, "mythos")?.id, "claude-mythos-5-2");
+	});
+});
+
+describe("supplemental models", () => {
+	it("clone the 5.1 entry under the new id when the catalog lacks it", () => {
+		const models = buildModels([mockPiAiModel("claude-fable-5-1", { contextWindow: 1000000, maxTokens: 128000 })]);
+		const f52 = find(models, "claude-fable-5-2");
+		assert.equal(f52?.name, "Claude Fable 5.2");
+		assert.equal(f52?.maxTokens, 128000);
+		assert.equal(f52?.headers, undefined, "clone goes through the same projection");
+		assert.equal(models[0].id, "claude-fable-5-2", "newest fable sorts first");
+		assert.ok(find(models, "claude-mythos-5-2"));
+	});
+
+	it("defer to the catalog once it lists the id", () => {
+		const models = buildModels([
+			mockPiAiModel("claude-fable-5-1"),
+			mockPiAiModel("claude-fable-5-2", { name: "from catalog" }),
+		]);
+		assert.equal(models.filter((m) => m.id === "claude-fable-5-2").length, 1);
+		assert.equal(find(models, "claude-fable-5-2")?.name, "from catalog");
+	});
+
+	it("add nothing without the clone source", () => {
+		const models = buildModels([mockPiAiModel("claude-opus-5-5")]);
+		assert.deepEqual(models.map((m) => m.id), ["claude-opus-5-5"]);
+	});
 });
 
 describe("Claude Code runtime policy", () => {
