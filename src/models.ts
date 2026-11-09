@@ -105,6 +105,10 @@ export type ClaudeCodeRuntimeModel = {
 const MEASURED_ONE_M = new Set([
 	"claude-fable-5",
 	"claude-fable-5-1",
+	// fable-5-2 [1m] measured 1M (CC 2.1.321 modelUsage, 2026-11-09). mythos-5-2
+	// is unmeasured (our org gets 404) and follows its Fable sibling.
+	"claude-fable-5-2",
+	"claude-mythos-5-2",
 	"claude-opus-5-5",
 	"claude-opus-5",
 	"claude-opus-4-8",
